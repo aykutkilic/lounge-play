@@ -14,7 +14,8 @@
         "three/addons/": "./vendor/three/examples/jsm/",
         "@trystero-p2p/nostr": "./vendor/trystero-nostr/index.mjs",
         "@trystero-p2p/core": "./vendor/trystero-core/index.mjs",
-        "@noble/secp256k1": "./vendor/noble-secp256k1/index.js"
+        "@noble/secp256k1": "./vendor/noble-secp256k1/index.js",
+        "pdfjs-dist": "./vendor/pdfjs/build/pdf.min.mjs"
       }
     }
   </script>
@@ -62,7 +63,32 @@
       <span id="status" class="status" hidden></span>
       <button id="standBtn" class="stand" title="Stand up" hidden>🧍</button>
       <div id="emojiBar" class="emoji-bar"></div>
+      <button id="bagBtn" class="bag-btn" title="Your suitcase of books">🧳</button>
       <button id="menuBtn" class="menu-btn" title="Order something">🍽️</button>
+    </div>
+
+    <div id="readerBar" class="reader-bar" hidden>
+      <button id="prevPage" title="Previous page (←)">◀</button>
+      <span id="pageLabel" class="page-label"></span>
+      <button id="nextPage" title="Next page (→)">▶</button>
+      <button id="unfoldBtn" title="Unfold / look closer (U)">🗺️</button>
+      <button id="closeBook" title="Close the book (Esc)">📕</button>
+    </div>
+
+    <div id="suitcase" class="panel suitcase" hidden>
+      <div class="case-lid">
+        <span class="case-handle"></span>
+        <span class="case-title">🧳</span>
+        <span class="case-note">🔒 your PDFs stay on this device</span>
+      </div>
+      <div class="case-body">
+        <div id="bookList" class="book-list"></div>
+        <label class="add-books" title="Add PDFs">
+          <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple hidden>
+          <span class="add-icon">📥</span>
+          <small>add PDFs<br>or drop them here</small>
+        </label>
+      </div>
     </div>
 
     <div id="emojiPanel" class="panel emoji-panel" hidden>
@@ -74,7 +100,7 @@
       <div id="menuItems" class="menu-grid"></div>
     </div>
 
-    <div id="hint" class="hint">👆 floor ➜ 🚶 &nbsp;·&nbsp; 👆 seat ➜ 🪑 &nbsp;·&nbsp; drag ➜ 👀 &nbsp;·&nbsp; 🍽️ ➜ ☕🍩</div>
+    <div id="hint" class="hint">👆 floor ➜ 🚶 &nbsp;·&nbsp; 👆 seat ➜ 🪑 &nbsp;·&nbsp; drag ➜ 👀 &nbsp;·&nbsp; 🍽️ ➜ ☕🍩 &nbsp;·&nbsp; 🧳 ➜ 📖</div>
   </section>
 
   <div id="toast" class="toast"></div>

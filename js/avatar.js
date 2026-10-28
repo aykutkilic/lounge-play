@@ -243,6 +243,31 @@ export class Avatar {
     this.items[kind] = null;
   }
 
+  setReading(on) {
+    this.reading = !!on;
+    if (on && !this.book) {
+      const leather = mat('#6b3a2a', { roughness: 0.6 });
+      const paper = mat('#f3ead6', { roughness: 0.9 });
+      const book = new THREE.Group();
+      for (const side of [-1, 1]) {
+        const half = new THREE.Group();
+        half.add(rbox(0.16, 0.012, 0.2, leather, side * 0.08, 0, 0, 0.004));
+        half.add(rbox(0.15, 0.012, 0.19, paper, side * 0.075, 0.01, 0, 0.003));
+        half.rotation.z = side * -0.25;
+        book.add(half);
+      }
+      book.position.set(0, 0.68, 0.3);
+      book.rotation.x = -0.9;
+      this.rig.add(book);
+      this.book = book;
+      // the book can hide behind the body, so also float a little 📖 over the head
+      this.readIcon = sprite(emojiTexture('📖'), 0.3);
+      this.readIcon.position.set(0, 1.95, 0);
+      this.rig.add(this.readIcon);
+    }
+    if (this.book) this.book.visible = this.readIcon.visible = this.reading;
+  }
+
   handPosition(kind, out = new THREE.Vector3()) {
     out.set(kind === 'drink' ? 0.36 : -0.36, 0.62, 0.22);
     return this.rig.localToWorld(out);
@@ -329,6 +354,11 @@ export class Avatar {
       it.sprite.scale.set(size, size, 1);
       arm.rotation.x = -0.9 - lift * 0.9;
     }
+    if (this.reading) {
+      for (const a of this.arms) a.rotation.x = -1.15;
+      this.readIcon.position.y = 1.95 + Math.sin(t * 1.8 + this.phase) * 0.04;
+    }
+
     const drink = this.items.drink;
     for (const st of this.steam) {
       st.s.visible = !!(drink && drink.hot);

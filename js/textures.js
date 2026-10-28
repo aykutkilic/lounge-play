@@ -297,3 +297,147 @@ export function bubbleTexture(text) {
   const tex = toTexture(c);
   return { tex, aspect: w / 150 };
 }
+
+// ---------------------------------------------------------------- books
+
+export const LEATHERS = ['#6b2d24', '#8a5a34', '#2f4a3a', '#2c3550', '#4a2c3e', '#5a3a22', '#7a4a2a', '#3a3a3a'];
+
+function grain(g, w, h, r, amount) {
+  for (let i = 0; i < w * h * amount; i++) {
+    const v = r();
+    g.fillStyle = v > 0.5 ? `rgba(255,240,220,${(v - 0.5) * 0.08})` : `rgba(0,0,0,${v * 0.12})`;
+    const s = 1 + r() * 2.5;
+    g.fillRect(r() * w, r() * h, s, s);
+  }
+  // soft creases
+  g.globalAlpha = 0.07;
+  g.strokeStyle = '#000';
+  for (let i = 0; i < 26; i++) {
+    g.lineWidth = 1 + r() * 2;
+    g.beginPath();
+    const x = r() * w;
+    const y = r() * h;
+    g.moveTo(x, y);
+    g.quadraticCurveTo(x + (r() - 0.5) * 120, y + (r() - 0.5) * 120, x + (r() - 0.5) * 200, y + (r() - 0.5) * 200);
+    g.stroke();
+  }
+  g.globalAlpha = 1;
+}
+
+function wrapLines(g, text, maxW, maxLines) {
+  const words = text.split(/\s+/);
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    const test = line ? `${line} ${w}` : w;
+    if (g.measureText(test).width > maxW && line) {
+      lines.push(line);
+      line = w;
+    } else line = test;
+  }
+  if (line) lines.push(line);
+  if (lines.length > maxLines) {
+    lines.length = maxLines;
+    lines[maxLines - 1] = `${lines[maxLines - 1].replace(/\s*\S*$/, '')}…`;
+  }
+  return lines;
+}
+
+// Front cover: grained leather, stitched border, gold-embossed title.
+export function leatherCover(color, title, aspect = 0.7, seed = 7) {
+  const H = 1024;
+  const W = Math.round(H * aspect);
+  const [c, g] = canvas(W, H);
+  const r = rng(seed);
+  g.fillStyle = color;
+  g.fillRect(0, 0, W, H);
+  grain(g, W, H, r, 0.02);
+  const vig = g.createRadialGradient(W / 2, H / 2, H * 0.2, W / 2, H / 2, H * 0.75);
+  vig.addColorStop(0, 'rgba(255,255,255,0.06)');
+  vig.addColorStop(1, 'rgba(0,0,0,0.35)');
+  g.fillStyle = vig;
+  g.fillRect(0, 0, W, H);
+  g.setLineDash([14, 10]);
+  g.lineWidth = 4;
+  g.strokeStyle = 'rgba(232,206,150,0.55)';
+  g.strokeRect(34, 34, W - 68, H - 68);
+  g.setLineDash([]);
+  g.lineWidth = 3;
+  g.strokeStyle = 'rgba(214,176,92,0.85)';
+  g.strokeRect(70, 70, W - 140, H - 140);
+  // ornament + title
+  const gold = g.createLinearGradient(0, H * 0.3, 0, H * 0.6);
+  gold.addColorStop(0, '#f6dc8c');
+  gold.addColorStop(0.5, '#c9a243');
+  gold.addColorStop(1, '#f1d27a');
+  g.fillStyle = gold;
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.font = '700 64px Georgia, "Times New Roman", serif';
+  const lines = wrapLines(g, title, W - 200, 4);
+  const lh = 78;
+  const y0 = H * 0.42 - ((lines.length - 1) * lh) / 2;
+  g.shadowColor = 'rgba(0,0,0,0.6)';
+  g.shadowOffsetY = 3;
+  g.shadowBlur = 4;
+  lines.forEach((l, i) => g.fillText(l, W / 2, y0 + i * lh));
+  g.shadowColor = 'transparent';
+  g.font = '48px Georgia, serif';
+  g.fillText('❦', W / 2, y0 - lh * 1.1);
+  g.fillText('❦', W / 2, y0 + lines.length * lh + lh * 0.2);
+  return toTexture(c);
+}
+
+export function leatherPlain(color, seed = 8) {
+  const [c, g] = canvas(256);
+  g.fillStyle = color;
+  g.fillRect(0, 0, 256, 256);
+  grain(g, 256, 256, rng(seed), 0.03);
+  return toTexture(c);
+}
+
+// Marbled endpaper, the classic inside of an old leather book.
+export function marbled(seed = 3) {
+  const [c, g] = canvas(512, 720);
+  const r = rng(seed);
+  const pal = ['#1f3b5a', '#b8573a', '#e6c88f', '#2f5d50', '#f3e9d2', '#7a2f3a'];
+  g.fillStyle = '#efe2c4';
+  g.fillRect(0, 0, 512, 720);
+  for (let i = 0; i < 260; i++) {
+    g.fillStyle = pal[Math.floor(r() * pal.length)];
+    g.globalAlpha = 0.55;
+    g.beginPath();
+    g.arc(r() * 512, r() * 720, 6 + r() * 40, 0, Math.PI * 2);
+    g.fill();
+  }
+  // comb the drops into swirls
+  const img = g.getImageData(0, 0, 512, 720);
+  const out = g.createImageData(512, 720);
+  for (let y = 0; y < 720; y++) {
+    for (let x = 0; x < 512; x++) {
+      const sx = Math.min(511, Math.max(0, Math.round(x + Math.sin(y / 18) * 22 + Math.sin(y / 5.3) * 4)));
+      const sy = Math.min(719, Math.max(0, Math.round(y + Math.sin(x / 30) * 26)));
+      const si = (sy * 512 + sx) * 4;
+      const di = (y * 512 + x) * 4;
+      out.data[di] = img.data[si];
+      out.data[di + 1] = img.data[si + 1];
+      out.data[di + 2] = img.data[si + 2];
+      out.data[di + 3] = 255;
+    }
+  }
+  g.putImageData(out, 0, 0);
+  g.globalAlpha = 1;
+  return toTexture(c);
+}
+
+export function pageEdges() {
+  const [c, g] = canvas(64, 256);
+  g.fillStyle = '#efe6d2';
+  g.fillRect(0, 0, 64, 256);
+  for (let y = 0; y < 256; y += 2) {
+    g.fillStyle = `rgba(120,100,70,${0.08 + Math.random() * 0.1})`;
+    g.fillRect(0, y, 64, 1);
+  }
+  const t = toTexture(c, [1, 6]);
+  return t;
+}

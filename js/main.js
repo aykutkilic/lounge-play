@@ -11,6 +11,8 @@ import { Avatar, Waiter, Fx } from './avatar.js';
 import { Music } from './music.js';
 import { Net } from './net.js';
 import { TRANSPORT } from './config.js';
+import { Reader } from './reader.js';
+import { listBooks, addFiles, removeBook } from './library.js';
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -34,6 +36,8 @@ renderer.toneMapping = THREE.NeutralToneMapping;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 1200);
+camera.userData.maxTexture = renderer.capabilities.maxTextureSize;
+scene.add(camera); // the reader's book and hands hang off the camera
 const controls = new OrbitControls(camera, canvas);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
@@ -268,6 +272,8 @@ function teardownRoom({ keepWorld = false } = {}) {
 }
 
 function leaveRoom() {
+  pendingBook = null;
+  if (reader.active) reader.finish();
   net.send({ t: 'leave' });
   music.stop();
   preview = teardownRoom({ keepWorld: true });
@@ -289,6 +295,7 @@ function addAvatar(peer, quiet = false) {
   }
   if (peer.drink) a.setItem('drink', peer.drink.item, peer.drink.at);
   if (peer.snack) a.setItem('snack', peer.snack.item, peer.snack.at);
+  if (peer.reading) a.setReading(true);
   if (!quiet) {
     current.fx.burst('✨', a.position.clone().setY(1.6), 3);
     log(peer.id, '👋', true);
@@ -357,6 +364,8 @@ function deliver(o) {
   if (o.id === current.myId) setStatus('');
 }
 
+net.on('reading', ({ id, on }) => current?.avatars.get(id)?.setReading(on));
+
 net.on('finished', ({ id, kind }) => {
   const a = current?.avatars.get(id);
   if (!a) return;
@@ -369,7 +378,8 @@ net.on('error', ({ code, seat }) => {
   document.body.classList.remove('busy');
   toast(ERRORS[code] || '⚠️');
   // p2p: someone else claimed my seat first, so hop back up
-  if (code === 'seat-taken' && seat && mine()?.seat?.id === seat) standUp();
+  if (code === 'seat-taken' && seat && mine()?.seat?.id === seat) { if (reader.active) reader.close(); standUp(); }
+  if (code === 'seat-taken') pendingBook = null;
   if (code === 'full' && joining && !current) joining = null;
 });
 
@@ -434,9 +444,144 @@ function togglePanel(id) {
 function closePanels() {
   $('emojiPanel').hidden = true;
   $('menuPanel').hidden = true;
+  $('suitcase').hidden = true;
 }
 
 $('menuBtn').onclick = () => togglePanel('menuPanel');
+
+// ---------------------------------------------------------------- suitcase & reading
+
+let pendingBook = null;
+
+const reader = new Reader({
+  camera,
+  onChange: (st) => {
+    $('pageLabel').textContent = st.label;
+    $('prevPage').disabled = !st.canPrev || st.unfolded;
+    $('nextPage').disabled = !st.canNext || st.unfolded;
+    $('unfoldBtn').hidden = !st.unfold && !st.unfolded;
+    $('unfoldBtn').textContent = st.unfolded ? '↩️' : st.unfold;
+  },
+  onClose: (ok) => {
+    if (!ok) toast('📄❌');
+    $('readerBar').hidden = true;
+    $('bagBtn').hidden = false;
+    controls.enabled = true;
+    if (current) {
+      bloom.strength = current.theme.bloom.strength;
+      const a = mine();
+      if (a) a.group.visible = true;
+      $('standBtn').hidden = !a?.seat;
+      net.send({ t: 'reading', on: false });
+    }
+  },
+});
+
+async function renderSuitcase() {
+  const books = await listBooks();
+  $('bookList').replaceChildren(...books.map((book) => {
+    const b = document.createElement('button');
+    b.className = 'book';
+    b.style.setProperty('--leather', book.leather);
+    b.title = book.name;
+    const title = document.createElement('span');
+    title.className = 'book-title';
+    title.textContent = book.name;
+    const meta = document.createElement('span');
+    meta.className = 'book-meta';
+    meta.textContent = `${book.pages} p${book.lastPage > 1 ? ` · 🔖 ${book.lastPage}` : ''}`;
+    const remove = document.createElement('span');
+    remove.className = 'book-remove';
+    remove.textContent = '✕';
+    remove.title = 'Take out of the suitcase';
+    remove.onclick = async (e) => {
+      e.stopPropagation();
+      await removeBook(book.id);
+      renderSuitcase();
+    };
+    b.append(title, meta, remove);
+    b.onclick = () => startReading(book);
+    return b;
+  }));
+  $('suitcase').classList.toggle('empty', books.length === 0);
+}
+
+async function addToSuitcase(files) {
+  if (!files?.length) return;
+  $('suitcase').classList.add('busy');
+  const n = await addFiles([...files]);
+  $('suitcase').classList.remove('busy');
+  toast(n ? `📚 +${n}` : '📄❌');
+  if (!$('suitcase').hidden) renderSuitcase();
+}
+
+$('bagBtn').onclick = () => {
+  togglePanel('suitcase');
+  if (!$('suitcase').hidden) renderSuitcase();
+};
+$('pdfInput').onchange = async (e) => {
+  await addToSuitcase(e.target.files);
+  e.target.value = '';
+};
+addEventListener('dragover', (e) => {
+  if (current && [...e.dataTransfer.types].includes('Files')) e.preventDefault();
+});
+addEventListener('drop', async (e) => {
+  if (!current || !e.dataTransfer.files.length) return;
+  e.preventDefault();
+  $('suitcase').hidden = false;
+  await addToSuitcase(e.dataTransfer.files);
+  renderSuitcase();
+});
+
+// prefer a leather armchair, then a sofa, then anything free; nearest first
+const SEAT_PREFERENCE = { armchair: 0, sofa: 1, loveseat: 1 };
+function findReadingSeat(a) {
+  let best = null;
+  let bestScore = Infinity;
+  for (const s of current.world.seats.values()) {
+    if (current.seatOwners.has(s.id)) continue;
+    const type = current.room.layout[s.index].type;
+    const score = (SEAT_PREFERENCE[type] ?? 2) * 100 + s.pos.distanceTo(a.position);
+    if (score < bestScore) { bestScore = score; best = s; }
+  }
+  return best;
+}
+
+function startReading(book) {
+  closePanels();
+  const a = mine();
+  if (!a || reader.active) return;
+  pendingBook = book;
+  if (a.seat || a.pendingSeat) return; // already sitting / on the way: opens once seated
+  const seat = findReadingSeat(a);
+  if (!seat) { pendingBook = null; toast('🪑❌'); return; }
+  net.send({ t: 'sit', seat: seat.id });
+}
+
+function beginReading(book) {
+  const a = mine();
+  const seat = a.seat;
+  const fwd = new THREE.Vector3(Math.sin(seat.rot), 0, Math.cos(seat.rot));
+  const eye = seat.pos.clone().add(new THREE.Vector3(0, 0.86, 0)).addScaledVector(fwd, 0.06);
+  document.activeElement?.blur?.(); // keys belong to the book now (not the volume slider or file picker)
+  controls.enabled = false;
+  cursorRing.visible = false;
+  a.group.visible = false; // we're looking out of these eyes now
+  $('readerBar').hidden = false;
+  $('standBtn').hidden = true;
+  $('bagBtn').hidden = true;
+  $('pageLabel').textContent = '…';
+  $('unfoldBtn').hidden = true;
+  bloom.strength = current.theme.bloom.strength * 0.35;
+  net.send({ t: 'reading', on: true });
+  reader.open(book, { handColor: me.color, eye, yaw: seat.rot });
+}
+
+$('prevPage').onclick = () => reader.turn(-1);
+$('nextPage').onclick = () => reader.turn(1);
+$('unfoldBtn').onclick = () => reader.toggleUnfold();
+$('closeBook').onclick = () => reader.close();
 $('leaveBtn').onclick = leaveRoom;
 function standUp() {
   const a = mine();
@@ -495,7 +640,9 @@ function toast(text) {
 }
 
 addEventListener('keydown', (e) => {
-  if (!current || e.target instanceof HTMLInputElement) return;
+  const typing = e.target instanceof HTMLInputElement && e.target.type !== 'file';
+  if (!current || typing) return;
+  if (reader.active && reader.key(e)) { e.preventDefault(); return; }
   if (e.key === 'Escape') closePanels();
   const n = Number(e.key);
   if (n >= 1 && n <= 9) sendEmoji(QUICK[n - 1]);
@@ -536,10 +683,19 @@ function chooseSeat(index, point) {
 }
 
 // event timestamps (not handler time) so a slow frame between down and up doesn't turn a click into a long-press
-canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, t: e.timeStamp }; });
-canvas.addEventListener('pointermove', (e) => { hoverEvent = e; });
+canvas.addEventListener('pointerdown', (e) => {
+  if (reader.active) { closePanels(); reader.pointerDown(e); return; }
+  down = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (reader.active) { reader.pointerMove(e); return; }
+  hoverEvent = e;
+});
+canvas.addEventListener('dblclick', (e) => reader.doubleClick(e));
+canvas.addEventListener('wheel', (e) => { if (reader.active) { e.preventDefault(); reader.wheel(e); } }, { passive: false });
 canvas.addEventListener('pointerleave', () => { hoverEvent = null; cursorRing.visible = false; });
 canvas.addEventListener('pointerup', (e) => {
+  if (reader.active) { reader.pointerUp(e); return; }
   if (!down) return;
   const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
   const quick = e.timeStamp - down.t < 600;
@@ -572,7 +728,7 @@ function pulseAt(p) {
 }
 
 function updateHover() {
-  if (!hoverEvent || !current || down) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
+  if (!hoverEvent || !current || down || reader.active) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
   const hit = hitTest(hoverEvent);
   if (!hit) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
   canvas.style.cursor = hit.kind === 'taken' ? 'not-allowed' : 'pointer';
@@ -600,6 +756,10 @@ function simulate(dt) {
     current.waiter?.update(dt, t, current.avatars, deliver);
     current.fx.update(dt);
     const a = mine();
+    if (pendingBook && a?.seat && a.state === 'sitting') {
+      beginReading(pendingBook);
+      pendingBook = null;
+    }
     if (follow && a) controls.target.lerp(new THREE.Vector3(a.position.x, 0.8, a.position.z), Math.min(1, dt * 3));
     const { hw, hd } = current.world.bounds;
     controls.target.x = THREE.MathUtils.clamp(controls.target.x, -hw - 2, hw + 2);
@@ -615,7 +775,8 @@ function simulate(dt) {
     clickPulse.scale.setScalar(0.6 + pulseT * 1.4);
     clickPulse.material.opacity = 0.9 * (1 - pulseT);
   }
-  controls.update(dt);
+  if (reader.active) reader.update(dt, clock);
+  else controls.update(dt);
 }
 
 function frame(now) {

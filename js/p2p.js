@@ -42,9 +42,10 @@ function sanitize(s) {
     room,
     avatar: AVATAR_SET.has(s.avatar) ? s.avatar : AVATARS[0],
     color: COLOR_SET.has(s.color) ? s.color : COLORS[0],
-    x: 0, z: 0, seat: null, seatAt: 0, drink: null, snack: null,
+    x: 0, z: 0, seat: null, seatAt: 0, drink: null, snack: null, reading: false,
   };
   if (!room) return out;
+  out.reading = s.reading === true;
   const def = ROOM_BY_ID[room];
   if (Number.isFinite(s.x) && Number.isFinite(s.z)) [out.x, out.z] = clamp(def, s.x, s.z);
   if (seatExists(def, s.seat)) {
@@ -125,7 +126,7 @@ export class P2PNet extends EventTarget {
   }
 
   publicPeer(id, s) {
-    return { id, avatar: s.avatar, color: s.color, x: s.x, z: s.z, seat: s.seat, drink: s.drink, snack: s.snack };
+    return { id, avatar: s.avatar, color: s.color, x: s.x, z: s.z, seat: s.seat, drink: s.drink, snack: s.snack, reading: s.reading };
   }
 
   // ---------------------------------------------------------------- outgoing
@@ -144,7 +145,7 @@ export class P2PNet extends EventTarget {
           room: msg.room,
           avatar: AVATAR_SET.has(msg.avatar) ? msg.avatar : AVATARS[0],
           color: COLOR_SET.has(msg.color) ? msg.color : COLORS[0],
-          x, z, seat: null, seatAt: 0, drink: null, snack: null,
+          x, z, seat: null, seatAt: 0, drink: null, snack: null, reading: false,
         };
         this.broadcast();
         this.emit('welcome', {
@@ -156,7 +157,7 @@ export class P2PNet extends EventTarget {
       case 'leave':
         if (!this.me) return;
         this.clearItems();
-        this.me = { ...this.me, room: null, seat: null, drink: null, snack: null };
+        this.me = { ...this.me, room: null, seat: null, drink: null, snack: null, reading: false };
         this.broadcast();
         break;
       case 'move': {
@@ -174,6 +175,14 @@ export class P2PNet extends EventTarget {
         this.me.seatAt = Date.now();
         this.broadcast();
         this.emit('sat', { id: this.id, seat: msg.seat });
+        break;
+      }
+      case 'reading': {
+        const on = msg.on === true;
+        if (!room || this.me.reading === on) return;
+        this.me.reading = on;
+        this.broadcast();
+        this.emit('reading', { id: this.id, on });
         break;
       }
       case 'emoji': {
@@ -239,6 +248,7 @@ export class P2PNet extends EventTarget {
     for (const kind of ['drink', 'snack']) {
       if (prev[kind] && !next[kind]) this.emit('finished', { id: pid, kind });
     }
+    if (prev.reading !== next.reading) this.emit('reading', { id: pid, on: next.reading });
   }
 
   // Two people grabbed the same seat at once: the earlier claim keeps it.
