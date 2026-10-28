@@ -14,5 +14,9 @@ and AO/roughness/metal packed as `arm.jpg`; HDRIs: downsampled to 512×256).
 | `textures/wood_floor_deck` | https://polyhaven.com/a/wood_floor_deck | Sunset Terrace deck |
 | `textures/brown_leather` | https://polyhaven.com/a/brown_leather | leather armchairs |
 | `textures/velour_velvet` | https://polyhaven.com/a/velour_velvet | sofa upholstery (relief only) |
+| `textures/dark_wood` | https://polyhaven.com/a/dark_wood | wood grain on wooden furniture (tinted to each piece's colour) |
+| `textures/beige_wall_001` | https://polyhaven.com/a/beige_wall_001 | the plaster under the library's wallpaper (relief only) |
 | `hdri/fireplace.hdr` | https://polyhaven.com/a/fireplace | Fireside Library reflections and ambient light |
 | `hdri/shanghai_bund.hdr` | https://polyhaven.com/a/shanghai_bund | Rainy Rooftop reflections and ambient light |
+| `hdri/chinese_garden.hdr` | https://polyhaven.com/a/chinese_garden | Greenhouse Café reflections and ambient light |
+| `hdri/umhlanga_sunrise.hdr` | https://polyhaven.com/a/umhlanga_sunrise | Sunset Terrace reflections and ambient light |
