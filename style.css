@@ -138,6 +138,18 @@ body.busy, body.busy * { cursor: progress !important; }
 .swatches button:hover { transform: scale(1.15); }
 .swatches button.on { box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--ink); }
 
+.tones { display: flex; gap: 4px; }
+.tones button {
+  font-family: var(--emoji);
+  font-size: 18px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  transition: transform 0.12s, background 0.12s;
+}
+.tones button:hover { transform: scale(1.12); }
+.tones button.on { background: #fff; box-shadow: 0 0 0 2px var(--accent); }
+
 .rooms { display: grid; gap: 10px; }
 
 .room-card {

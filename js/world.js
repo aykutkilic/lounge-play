@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import { Sky } from 'three/addons/objects/Sky.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { BUILDERS, mat, box, rbox, cyl, softDot, shade } from './furniture.js';
 import * as TX from './textures.js';
 import { roomMenu } from './shared.js';
@@ -29,14 +31,18 @@ export function buildWorld(room, theme) {
   const { w, d } = room.size;
 
   // ------------------------------------------------------------ light
+  // Ambient light comes mostly from the environment map (the room's own sky);
+  // the hemisphere light just adds a touch of colour bounce.
   const hemi = new THREE.HemisphereLight(...theme.hemi);
   const key = new THREE.DirectionalLight(theme.key.color, theme.key.intensity);
   key.position.set(...theme.key.pos);
+  if (theme.sun) key.position.copy(sunDirection(theme.sun)).multiplyScalar(40); // shadows fall the way the sky says
   key.castShadow = true;
   key.shadow.mapSize.set(2048, 2048);
-  Object.assign(key.shadow.camera, { left: -13, right: 13, top: 13, bottom: -13, near: 1, far: 80 });
+  Object.assign(key.shadow.camera, { left: -13, right: 13, top: 13, bottom: -13, near: 1, far: 90 });
   key.shadow.bias = -0.0004;
   key.shadow.normalBias = 0.03;
+  key.shadow.radius = 3;
   root.add(hemi, key, key.target);
 
   // ------------------------------------------------------------ floor
@@ -54,7 +60,7 @@ export function buildWorld(room, theme) {
   }
 
   const walls = buildWalls(room, theme, root);
-  const envMeshes = buildOutside(room, theme, root, ctx);
+  const envScene = buildOutside(room, theme, root, ctx);
   buildParticles(room, theme, root, ctx);
 
   // ------------------------------------------------------------ furniture
@@ -79,6 +85,7 @@ export function buildWorld(room, theme) {
     furniture.push(obj);
     for (const l of out.library || []) {
       l.mesh.userData.libraryBook = l.id;
+      l.mesh.userData.keep = true;
       library.set(l.id, l);
       pickables.push(l.mesh);
     }
@@ -96,12 +103,7 @@ export function buildWorld(room, theme) {
           approach: p.clone().addScaledVector(fwd, 0.75),
         });
       });
-      obj.traverse((o) => {
-        if (o.isMesh) {
-          o.userData.furniture = index;
-          pickables.push(o);
-        }
-      });
+      obj.userData.seatIndex = index; // its meshes become pickable once merged (below)
     }
 
     if (item.type === 'counter') {
@@ -133,6 +135,21 @@ export function buildWorld(room, theme) {
     });
   }
 
+  // Fewer draw calls: each piece of furniture (and each wall) collapses into one
+  // mesh per material. Done after the colliders, which want the individual parts.
+  for (const obj of furniture) {
+    mergeStatic(obj);
+    if (obj.userData.seatIndex !== undefined) {
+      obj.traverse((o) => {
+        if (o.isMesh) {
+          o.userData.furniture = obj.userData.seatIndex;
+          pickables.push(o);
+        }
+      });
+    }
+  }
+  for (const wall of walls) mergeStatic(wall.frame);
+
   // Keeps a body of radius r inside the room and out of the furniture.
   function resolve(x, z, r = 0.3) {
     for (let iter = 0; iter < 3; iter++) {
@@ -155,7 +172,8 @@ export function buildWorld(room, theme) {
   }
 
   return {
-    root, seats, pickables, floor, waiter, bounds, envMeshes, resolve, library, door,
+    root, seats, pickables, floor, waiter, bounds, envScene, resolve, library, door,
+    shadowsDirty: true, // shadows are rendered once, then only when something big changes
     update(dt, t, camera) {
       for (const fn of animators) fn(dt, t, camera);
       for (const wall of walls) {
@@ -165,6 +183,7 @@ export function buildWorld(room, theme) {
           wall.full.visible = show;
           wall.attach.visible = show;
           if (wall.stub) wall.stub.visible = !show;
+          this.shadowsDirty = true;
         }
       }
     },
@@ -180,6 +199,53 @@ export function buildWorld(room, theme) {
       });
     },
   };
+}
+
+// Merges the static meshes under `root` into one mesh per material (in root's
+// space). Subtrees marked userData.animated (they move) or .separate (they get
+// shown/hidden) are merged on their own; meshes marked .keep are left alone.
+export function mergeStatic(root) {
+  root.updateMatrixWorld(true);
+  const toRoot = new THREE.Matrix4().copy(root.matrixWorld).invert();
+  const groups = new Map();
+  const visit = (node) => {
+    for (const child of [...node.children]) {
+      if (child.userData.animated || child.userData.separate) { mergeStatic(child); continue; }
+      const g = child.geometry;
+      if (child.isMesh && !child.isInstancedMesh && !child.userData.keep && !Array.isArray(child.material)
+        && child.children.length === 0 && g.attributes.normal && g.attributes.uv && !g.groups.length) {
+        const key = `${child.material.uuid}|${g.index ? 1 : 0}|${child.castShadow}|${child.receiveShadow}|${child.renderOrder}`;
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(child);
+      }
+      visit(child);
+    }
+  };
+  visit(root);
+  const m = new THREE.Matrix4();
+  for (const meshes of groups.values()) {
+    if (meshes.length < 2) continue;
+    const parts = meshes.map((mesh) => {
+      const g = new THREE.BufferGeometry();
+      for (const name of ['position', 'normal', 'uv']) g.setAttribute(name, mesh.geometry.attributes[name].clone());
+      if (mesh.geometry.index) g.setIndex(mesh.geometry.index.clone());
+      return g.applyMatrix4(m.multiplyMatrices(toRoot, mesh.matrixWorld));
+    });
+    const merged = mergeGeometries(parts);
+    parts.forEach((g) => g.dispose());
+    if (!merged) continue;
+    const first = meshes[0];
+    const mesh = new THREE.Mesh(merged, first.material);
+    mesh.castShadow = first.castShadow;
+    mesh.receiveShadow = first.receiveShadow;
+    mesh.renderOrder = first.renderOrder;
+    for (const old of meshes) old.removeFromParent();
+    root.add(mesh);
+  }
+}
+
+function sunDirection({ elevation, azimuth }) {
+  return new THREE.Vector3().setFromSphericalCoords(1, THREE.MathUtils.degToRad(90 - elevation), THREE.MathUtils.degToRad(azimuth));
 }
 
 function nearestWall(walls, item, w, d) {
@@ -213,6 +279,7 @@ function buildWalls(room, theme, root) {
     frame.rotation.y = s.rot;
     root.add(frame);
     const full = new THREE.Group();
+    full.userData.separate = true;
     const attach = new THREE.Group();
     frame.add(full);
     root.add(attach);
@@ -230,6 +297,7 @@ function buildWalls(room, theme, root) {
       full.add(box(L, 0.14, 0.12, mat(spec.trim), 0, H - 0.07, 0.03));
       full.add(box(L, 0.04, T + 0.02, mat(spec.trim), 0, H + 0.02, -T / 2));
       stub = new THREE.Group();
+      stub.userData.separate = true;
       stub.add(box(L, 0.32, T, mat(spec.trim), 0, 0.16, -T / 2));
       stub.visible = false;
       frame.add(stub);
@@ -273,7 +341,7 @@ function buildWalls(room, theme, root) {
         }
       }
     }
-    walls.push({ ...s, full, attach, stub, cutaway });
+    walls.push({ ...s, frame, full, attach, stub, cutaway });
   }
 
   // A ceiling for walled rooms. It only faces down, so it's there when you look
@@ -320,15 +388,39 @@ function skyDome(stops) {
   return m;
 }
 
+// A physically based sky (Preetham scattering, with drifting clouds).
+function physicalSky(sun, ctx) {
+  const sky = new Sky();
+  sky.scale.setScalar(1000);
+  const u = sky.material.uniforms;
+  u.turbidity.value = sun.turbidity ?? 3;
+  u.rayleigh.value = sun.rayleigh ?? 1.2;
+  u.mieCoefficient.value = sun.mie ?? 0.005;
+  u.mieDirectionalG.value = sun.mieG ?? 0.8;
+  u.cloudCoverage.value = sun.clouds ?? 0.35;
+  u.cloudDensity.value = 0.35;
+  u.sunPosition.value.copy(sunDirection(sun));
+  ctx.animate((dt, t) => { u.time.value = t; });
+  return sky;
+}
+
+// Returns the scene the room's environment map (reflections + soft ambient
+// light) is made from: its sky outdoors, a neutral room indoors.
 function buildOutside(room, theme, root, ctx) {
   const { w, d } = room.size;
   const r = ctx.rand;
-  const envMeshes = [];
+  const envScene = new THREE.Scene();
 
-  if (theme.sky) {
+  if (theme.sun) {
+    const sky = physicalSky(theme.sun, ctx);
+    root.add(sky);
+    envScene.add(physicalSky(theme.sun, { animate() {} }));
+  } else if (theme.sky) {
     const sky = skyDome(theme.sky);
     root.add(sky);
-    envMeshes.push(sky);
+    envScene.add(sky.clone());
+  } else {
+    envScene.add(new RoomEnvironment());
   }
 
   if (theme.outside === 'garden') {
@@ -341,9 +433,11 @@ function buildOutside(room, theme, root, ctx) {
     path.rotation.x = -Math.PI / 2;
     path.position.set(0, -0.49, d / 2 + 20);
     root.add(path);
-    const greens = [mat('#3a7d44', { flatShading: true }), mat('#57a55a', { flatShading: true }), mat('#2d6a4f', { flatShading: true })];
+    const greens = [mat('#3a7d44', { roughness: 0.9 }), mat('#4f9a52', { roughness: 0.9 }), mat('#2d6a4f', { roughness: 0.9 })];
     const trunk = mat('#6b4a32');
-    const blobGeo = new THREE.IcosahedronGeometry(1, 1);
+    const blobGeo = new THREE.IcosahedronGeometry(1, 2);
+    const garden = new THREE.Group(); // merged into a handful of meshes below
+    root.add(garden);
     for (let i = 0; i < 70; i++) {
       const a = r() * Math.PI * 2;
       const dist = 13 + r() * 70;
@@ -370,8 +464,14 @@ function buildOutside(room, theme, root, ctx) {
         b.position.y = 0.3;
         g.add(b);
       }
-      root.add(g);
+      garden.add(g);
     }
+    mergeStatic(garden);
+    // green light bounces up from the lawn (unlit: the environment scene has no lights)
+    const lawn = new THREE.Mesh(new THREE.CircleGeometry(300, 32), new THREE.MeshBasicMaterial({ color: '#4f7a3a' }));
+    lawn.rotation.x = -Math.PI / 2;
+    lawn.position.y = -2;
+    envScene.add(lawn);
   }
 
   if (theme.outside === 'city') {
@@ -413,11 +513,11 @@ function buildOutside(room, theme, root, ctx) {
     const cityTex = TX.windowsTexture(12, 0.32);
     const city = new THREE.Mesh(
       mergeGeometries(geos),
-      new THREE.MeshStandardMaterial({ color: '#141926', map: cityTex, emissive: '#ffffff', emissiveMap: cityTex, emissiveIntensity: 0.65, roughness: 0.9 }),
+      new THREE.MeshStandardMaterial({ color: '#141926', map: cityTex, emissive: '#ffffff', emissiveMap: cityTex, emissiveIntensity: 0.55, roughness: 0.9 }),
     );
     geos.forEach((g) => g.dispose());
     root.add(city);
-    const beaconM = new THREE.MeshBasicMaterial({ color: new THREE.Color('#ff3030').multiplyScalar(4) });
+    const beaconM = new THREE.MeshBasicMaterial({ color: '#ff4a3a' });
     const beaconMeshes = beacons.map((p) => {
       const m = new THREE.Mesh(new THREE.SphereGeometry(0.5, 8, 6), beaconM);
       m.position.copy(p);
@@ -431,39 +531,44 @@ function buildOutside(room, theme, root, ctx) {
   }
 
   if (theme.outside === 'ocean') {
-    const geo = new THREE.PlaneGeometry(600, 600, 90, 90);
+    const geo = new THREE.PlaneGeometry(900, 900, 120, 120);
     geo.rotateX(-Math.PI / 2);
-    const base = geo.attributes.position.array.slice();
-    const ocean = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: '#3b7f9f', roughness: 0.34, metalness: 0.3, envMapIntensity: 1.2 }));
+    const ripples = TX.waterNormals();
+    ripples.repeat.set(90, 90);
+    const water = new THREE.MeshPhysicalMaterial({
+      color: '#0e3a4f', roughness: 0.08, metalness: 0, normalMap: ripples, normalScale: new THREE.Vector2(0.35, 0.35),
+      envMapIntensity: 1, clearcoat: 0, ior: 1.33, specularIntensity: 1,
+    });
+    const time = { value: 0 };
+    water.onBeforeCompile = (shader) => {
+      shader.uniforms.uTime = time;
+      const waves = /* glsl */`
+        uniform float uTime;
+        float wave(vec2 p) {
+          return sin(p.x * 0.12 + uTime * 0.9) * 0.22 + sin(p.y * 0.17 + uTime * 1.3) * 0.18 + sin((p.x + p.y) * 0.31 + uTime * 1.7) * 0.06;
+        }`;
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `#include <common>\n${waves}`)
+        .replace('#include <beginnormal_vertex>', `
+          vec2 wp = position.xz;
+          float e = 0.5;
+          vec3 objectNormal = normalize(vec3(wave(wp - vec2(e, 0.0)) - wave(wp + vec2(e, 0.0)), 2.0 * e, wave(wp - vec2(0.0, e)) - wave(wp + vec2(0.0, e))));
+          #ifdef USE_TANGENT
+            vec3 objectTangent = vec3(tangent.xyz);
+          #endif`)
+        .replace('#include <begin_vertex>', 'vec3 transformed = vec3(position.x, position.y + wave(position.xz), position.z);');
+    };
+    const ocean = new THREE.Mesh(geo, water);
     ocean.position.y = -1.3;
     ocean.receiveShadow = true;
     root.add(ocean);
-    const pos = geo.attributes.position;
-    let acc = 0;
     ctx.animate((dt, t) => {
-      acc += dt;
-      if (acc < 1 / 30) return;
-      acc = 0;
-      for (let i = 0; i < pos.count; i++) {
-        const x = base[i * 3];
-        const z = base[i * 3 + 2];
-        pos.array[i * 3 + 1] = Math.sin(x * 0.12 + t * 0.9) * 0.25 + Math.sin(z * 0.17 + t * 1.3) * 0.2 + Math.sin((x + z) * 0.31 + t * 1.7) * 0.08;
-      }
-      pos.needsUpdate = true;
-      geo.computeVertexNormals();
+      time.value = t;
+      ripples.offset.set(t * 0.012, t * 0.007);
     });
     // pilings
     const piling = mat('#5a4030', { roughness: 0.9 });
     for (const x of [-w / 2, -w / 6, w / 6, w / 2]) for (const z of [-d / 2, d / 2]) root.add(cyl(0.18, 0.2, 3, piling, x, -1.6, z, 10));
-    // sun
-    const sunTex = softDot();
-    const sun = new THREE.Sprite(new THREE.SpriteMaterial({ map: sunTex, color: new THREE.Color('#ffb36b').multiplyScalar(0.7), fog: false, depthWrite: false, blending: THREE.AdditiveBlending }));
-    sun.scale.set(40, 40, 1);
-    sun.position.set(-20, 14, -330);
-    root.add(sun);
-    const disc = new THREE.Mesh(new THREE.CircleGeometry(9, 32), new THREE.MeshBasicMaterial({ color: new THREE.Color('#fff0c0').multiplyScalar(1.3), fog: false }));
-    disc.position.set(-20, 12, -335);
-    root.add(disc);
     // islands
     const islandM = mat('#5a4a6b', { flatShading: true, roughness: 1, fog: true });
     for (const [x, z, s] of [[-140, -260, 30], [90, -280, 45], [190, -220, 22]]) {
@@ -493,7 +598,7 @@ function buildOutside(room, theme, root, ctx) {
       }
     });
   }
-  return envMeshes;
+  return envScene;
 }
 
 // ---------------------------------------------------------------- particles
@@ -504,7 +609,7 @@ function buildParticles(room, theme, root, ctx) {
   const kind = theme.particles;
 
   if (kind === 'dust' || kind === 'pollen') {
-    const n = 260;
+    const n = 140;
     const pos = new Float32Array(n * 3);
     const seeds = [];
     for (let i = 0; i < n; i++) {
@@ -513,8 +618,8 @@ function buildParticles(room, theme, root, ctx) {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     const pts = new THREE.Points(geo, new THREE.PointsMaterial({
-      map: softDot(), color: new THREE.Color(theme.dustColor).multiplyScalar(1.4), size: 0.07,
-      transparent: true, opacity: 0.6, depthWrite: false, blending: THREE.AdditiveBlending,
+      map: softDot(), color: new THREE.Color(theme.dustColor), size: 0.035,
+      transparent: true, opacity: 0.35, depthWrite: false, blending: THREE.AdditiveBlending,
     }));
     pts.frustumCulled = false;
     root.add(pts);
@@ -564,48 +669,60 @@ function buildParticles(room, theme, root, ctx) {
   }
 
   if (kind === 'rain') {
-    const n = 2200;
+    // Every drop is a short line whose fall is computed in the vertex shader.
+    const n = 2600;
     const area = 46;
-    const top = 22;
-    const pos = new Float32Array(n * 6);
-    const speed = new Float32Array(n);
+    const top = 26;
+    const base = new Float32Array(n * 2 * 3);
+    const tip = new Float32Array(n * 2);
+    const speed = new Float32Array(n * 2);
     for (let i = 0; i < n; i++) {
       const x = (r() - 0.5) * area;
-      const y = r() * top - 4;
+      const y = r() * top;
       const z = (r() - 0.5) * area;
-      pos.set([x, y, z, x + 0.03, y + 0.45, z], i * 6);
-      speed[i] = 13 + r() * 5;
+      const v = 11 + r() * 5;
+      for (let k = 0; k < 2; k++) {
+        base.set([x, y, z], (i * 2 + k) * 3);
+        tip[i * 2 + k] = k;
+        speed[i * 2 + k] = v;
+      }
     }
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    const rain = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ color: '#9fb4d8', transparent: true, opacity: 0.35, depthWrite: false }));
+    geo.setAttribute('position', new THREE.BufferAttribute(base, 3));
+    geo.setAttribute('tip', new THREE.BufferAttribute(tip, 1));
+    geo.setAttribute('speed', new THREE.BufferAttribute(speed, 1));
+    const uniforms = { uTime: { value: 0 }, uTop: { value: top }, uColor: { value: new THREE.Color('#aab7cc') } };
+    const rain = new THREE.LineSegments(geo, new THREE.ShaderMaterial({
+      uniforms,
+      transparent: true,
+      depthWrite: false,
+      vertexShader: /* glsl */`
+        attribute float tip;
+        attribute float speed;
+        uniform float uTime;
+        uniform float uTop;
+        varying float vFade;
+        void main() {
+          float y = mod(position.y - uTime * speed, uTop) - 4.0;
+          vec3 p = vec3(position.x - y * 0.05 + tip * 0.02, y + tip * 0.38, position.z);
+          vFade = 1.0 - tip * 0.7;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+        }`,
+      fragmentShader: /* glsl */`
+        uniform vec3 uColor;
+        varying float vFade;
+        void main() { gl_FragColor = vec4(uColor, 0.22 * vFade); }`,
+    }));
     rain.frustumCulled = false;
     root.add(rain);
-    ctx.animate((dt) => {
-      for (let i = 0; i < n; i++) {
-        const o = i * 6;
-        const dy = speed[i] * dt;
-        pos[o + 1] -= dy;
-        pos[o + 4] -= dy;
-        pos[o] -= dy * 0.06;
-        pos[o + 3] -= dy * 0.06;
-        const floorY = Math.abs(pos[o]) < w / 2 && Math.abs(pos[o + 2]) < d / 2 ? 0 : -6;
-        if (pos[o + 1] < floorY) {
-          const x = (Math.random() - 0.5) * area;
-          const z = (Math.random() - 0.5) * area;
-          const y = top - 4 + Math.random() * 2;
-          pos.set([x, y, z, x + 0.03, y + 0.45, z], o);
-        }
-      }
-      geo.attributes.position.needsUpdate = true;
-    });
+    ctx.animate((dt, t) => { uniforms.uTime.value = t; });
   }
 
   if (kind === 'fireflies') {
     const flies = [];
     for (let i = 0; i < 36; i++) {
-      const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: softDot(), color: new THREE.Color('#e9ff8a').multiplyScalar(2.5), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
-      s.scale.setScalar(0.12);
+      const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: softDot(), color: '#e9ff8a', transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+      s.scale.setScalar(0.08);
       const edge = r() < 0.5;
       const x = edge ? (r() < 0.5 ? -1 : 1) * (w / 2 - 0.5 - r() * 2) : (r() - 0.5) * w;
       const z = edge ? (r() - 0.5) * d : (r() < 0.5 ? -1 : 1) * (d / 2 - 0.5 - r() * 2);

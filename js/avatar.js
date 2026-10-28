@@ -1,9 +1,27 @@
 import * as THREE from 'three';
-import { emojiTexture, bubbleTexture, hashString } from './textures.js';
+import { emojiTexture, bubbleTexture, hashString, blobShadow } from './textures.js';
 import { mat, rbox, sphere, cyl, softDot } from './furniture.js';
 import { ITEMS, ITEM_LIFETIME } from './shared.js';
 
 const WALK_SPEED = 2.6;
+
+// A soft contact shadow on the floor (people and robots don't go into the
+// shadow map, which is only drawn once).
+// things that move never go into the (static) shadow map
+function noShadows(g) {
+  g.traverse((o) => { o.castShadow = false; });
+}
+
+function contactShadow(size) {
+  const m = new THREE.Mesh(
+    new THREE.PlaneGeometry(size, size),
+    new THREE.MeshBasicMaterial({ map: blobShadow(), transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4 }),
+  );
+  m.rotation.x = -Math.PI / 2;
+  m.position.y = 0.012;
+  m.renderOrder = 1;
+  return m;
+}
 const SIT_DROP = 0.27; // how far below the seat surface the avatar's origin sits
 
 function sprite(map, size, { depthTest = true, opacity = 1 } = {}) {
@@ -84,8 +102,9 @@ export class Avatar {
 
     this.body = new THREE.Mesh(new THREE.CapsuleGeometry(0.28, 0.42, 8, 16), bodyM);
     this.body.position.y = 0.61;
-    this.body.castShadow = true;
     this.rig.add(this.body);
+    this.shadow = contactShadow(0.95);
+    this.group.add(this.shadow);
     const belly = sphere(0.2, bellyM, 0, 0.55, 0.15, 16);
     belly.scale.set(1, 1.25, 0.55);
     this.rig.add(belly);
@@ -101,7 +120,6 @@ export class Avatar {
       pivot.position.set(s * 0.29, 0.82, 0);
       const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.22, 4, 8), bodyM);
       arm.position.y = -0.15;
-      arm.castShadow = true;
       pivot.add(arm);
       pivot.rotation.z = s * 0.25;
       this.rig.add(pivot);
@@ -146,6 +164,7 @@ export class Avatar {
     this.bubble = null;
     this.group.position.copy(this.pos);
     this.group.rotation.y = this.yaw;
+    noShadows(this.group);
   }
 
   get position() { return this.group.position; }
@@ -171,6 +190,17 @@ export class Avatar {
     if (this.state === 'sitting' || this.state === 'hopIn') this.standUp();
     this.target.copy(seat.approach);
     if (this.state !== 'hopOut') this.state = 'walk';
+  }
+
+  // First person: the controller moves us directly, the avatar just animates.
+  drive(x, z, moving) {
+    const dx = x - this.pos.x;
+    const dz = z - this.pos.z;
+    if (dx * dx + dz * dz > 1e-8) this.yaw = angleLerp(this.yaw, Math.atan2(dx, dz), 0.3);
+    this.pos.set(x, 0, z);
+    this.target.copy(this.pos);
+    this.state = moving ? 'walk' : 'idle';
+    this.linger = 0;
   }
 
   standUp() {
@@ -289,7 +319,10 @@ export class Avatar {
       const dx = to.x - this.pos.x;
       const dz = to.z - this.pos.z;
       const dist = Math.hypot(dx, dz);
-      const step = WALK_SPEED * dt;
+      // Other people's positions stream in a few times a second: keep a steady
+      // pace (a little quicker when falling behind) and don't stop for the
+      // moment between one update and the next.
+      const step = WALK_SPEED * (dist > 1.2 ? 1.5 : 1) * dt;
       if (dist <= step) {
         this.pos.copy(to);
         if (this.pendingSeat) {
@@ -298,9 +331,11 @@ export class Avatar {
           this.hop = { t: 0 };
           this.state = 'hopIn';
         } else {
-          this.state = 'idle';
+          this.linger = (this.linger || 0) + dt;
+          if (this.linger > 0.3) { this.state = 'idle'; this.linger = 0; }
         }
       } else {
+        this.linger = 0;
         this.pos.x += (dx / dist) * step;
         this.pos.z += (dz / dist) * step;
         this.yaw = angleLerp(this.yaw, Math.atan2(dx, dz), Math.min(1, dt * 10));
@@ -330,6 +365,10 @@ export class Avatar {
       this.rig.rotation.z *= 0.9;
       for (const a of this.arms) a.rotation.x *= 0.85;
     }
+
+    // contact shadow: on the floor, or on the seat when sitting
+    const ground = this.seat && (this.state === 'sitting' || this.state === 'hopIn') ? this.seat.pos.y + 0.01 : 0.012;
+    this.shadow.position.y = ground - this.group.position.y;
 
     // ---- idle life: breathing, emoji hop
     this.body.scale.y = 1 + Math.sin(t * 2.2 + this.phase) * 0.02;
@@ -433,8 +472,8 @@ export class Waiter {
     this.group.add(rig);
     const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.26, 0.3, 8, 16), shell);
     body.position.y = 0.72;
-    body.castShadow = true;
     rig.add(body);
+    this.group.add(contactShadow(0.9));
     rig.add(rbox(0.56, 0.06, 0.4, accent, 0, 0.92, 0.0, 0.03));
     const head = rbox(0.56, 0.42, 0.44, shell, 0, 1.3, 0, 0.12);
     rig.add(head);
@@ -456,7 +495,7 @@ export class Waiter {
     const tray = new THREE.Group();
     tray.position.set(0.3, 0.95, 0.3);
     const trayDisc = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 0.025, 24), mat('#c9a66b', { metalness: 0.6, roughness: 0.3 }));
-    trayDisc.castShadow = true;
+
     tray.add(trayDisc);
     rig.add(tray);
     this.tray = tray;
@@ -473,6 +512,7 @@ export class Waiter {
     this.state = 'idle';
     this.timer = 0;
     this.group.position.copy(this.pos);
+    noShadows(this.group);
   }
 
   enqueue(order) {
@@ -625,8 +665,8 @@ export class Maid {
     const white = mat('#f7f3ec', { roughness: 0.8 });
     const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.25, 0.36, 8, 16), dress);
     body.position.y = 0.56;
-    body.castShadow = true;
     this.rig.add(body);
+    this.group.add(contactShadow(0.9));
     const skirt = new THREE.Mesh(new THREE.ConeGeometry(0.36, 0.42, 20, 1, true), dress);
     skirt.position.y = 0.3;
     this.rig.add(skirt);
@@ -651,6 +691,7 @@ export class Maid {
     this.basket = basket;
     this.carried = [];
     this.plan = null;
+    noShadows(this.group);
   }
 
   run(plan, { onPick } = {}) {

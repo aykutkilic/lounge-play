@@ -65,7 +65,7 @@ export function sphere(r, material, x = 0, y = 0, z = 0, seg = 20) {
 }
 
 function blob(r, material, x, y, z) {
-  const g = geo(`ico${r}`, () => new THREE.IcosahedronGeometry(r, 1));
+  const g = geo(`ico${r}`, () => new THREE.IcosahedronGeometry(r, 3));
   return place(new THREE.Mesh(g, material), x, y, z);
 }
 
@@ -137,26 +137,33 @@ export function softDot() {
 export function makeFire(ctx, scale = 1, lightPower = 8) {
   const g = new THREE.Group();
   const flames = [];
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < 12; i++) {
     const m = new THREE.SpriteMaterial({ map: flameTex(), blending: THREE.AdditiveBlending, depthWrite: false, transparent: true });
     const s = new THREE.Sprite(m);
     g.add(s);
-    flames.push({ s, p: Math.random(), speed: 0.8 + Math.random() * 0.7, x: (Math.random() - 0.5) * 0.5 * scale, z: (Math.random() - 0.5) * 0.3 * scale });
+    flames.push({ s, p: Math.random(), speed: 0.9 + Math.random() * 0.7, x: (Math.random() - 0.5) * 0.42 * scale, z: (Math.random() - 0.5) * 0.25 * scale });
   }
-  const light = new THREE.PointLight('#ff8a3d', lightPower, 10 * scale, 1.6);
-  light.position.y = 0.5 * scale;
+  // a faint warm glow in the air around the fire (what the eye sees; no bloom needed)
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map: flameTex(), color: '#ff9a50', blending: THREE.AdditiveBlending, depthWrite: false, transparent: true, opacity: 0.12 }));
+  halo.scale.set(1.6 * scale, 1.3 * scale, 1);
+  halo.position.y = 0.35 * scale;
+  g.add(halo);
+  const light = new THREE.PointLight('#ff8b45', lightPower, 10 * scale, 1.8);
+  light.position.y = 0.45 * scale;
   g.add(light);
   ctx.animate((dt, t) => {
     for (const f of flames) {
       f.p = (f.p + dt * f.speed) % 1;
       const p = f.p;
-      f.s.position.set(f.x * (1 - p * 0.8), p * 0.85 * scale, f.z * (1 - p));
-      const sz = ((1 - p) * 0.5 + 0.12) * scale;
-      f.s.scale.set(sz, sz * 1.5, 1);
-      f.s.material.opacity = Math.sin(p * Math.PI) * 0.95;
-      f.s.material.color.setHSL(0.1 - p * 0.08, 1, 0.55 + (1 - p) * 0.15).multiplyScalar(1.6);
+      f.s.position.set(f.x * (1 - p * 0.8), p * 0.7 * scale, f.z * (1 - p));
+      const sz = ((1 - p) * 0.36 + 0.08) * scale;
+      f.s.scale.set(sz, sz * 1.6, 1);
+      f.s.material.opacity = Math.sin(p * Math.PI) * 0.7;
+      f.s.material.color.setHSL(0.09 - p * 0.07, 1, 0.5 + (1 - p) * 0.12);
     }
-    light.intensity = lightPower * (0.8 + 0.12 * Math.sin(t * 13.1) + 0.08 * Math.sin(t * 7.3 + 1.2) + 0.05 * Math.sin(t * 23.7));
+    const flicker = 0.85 + 0.09 * Math.sin(t * 13.1) + 0.05 * Math.sin(t * 7.3 + 1.2) + 0.03 * Math.sin(t * 23.7);
+    light.intensity = lightPower * flicker;
+    halo.material.opacity = 0.1 * flicker;
   });
   return g;
 }
@@ -185,11 +192,15 @@ export function stringOfLights(segments, { sag = 0.5, spacing = 0.4, color = '#f
   }
   const lineGeo = new THREE.BufferGeometry().setFromPoints(wire);
   g.add(new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({ color: '#222' })));
-  const bulbMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(5) });
-  const inst = new THREE.InstancedMesh(new THREE.SphereGeometry(0.05, 8, 6), bulbMat, bulbs.length);
+  const bulbMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(color).lerp(new THREE.Color('#ffffff'), 0.4) });
+  const inst = new THREE.InstancedMesh(new THREE.SphereGeometry(0.04, 8, 6), bulbMat, bulbs.length);
   const m4 = new THREE.Matrix4();
   bulbs.forEach((p, i) => inst.setMatrixAt(i, m4.makeTranslation(p.x, p.y - 0.06, p.z)));
   g.add(inst);
+  const halos = new THREE.BufferGeometry().setFromPoints(bulbs.map((p) => new THREE.Vector3(p.x, p.y - 0.06, p.z)));
+  g.add(new THREE.Points(halos, new THREE.PointsMaterial({
+    map: flameTex(), color, size: 0.26, transparent: true, opacity: 0.3, depthWrite: false, blending: THREE.AdditiveBlending,
+  })));
   return g;
 }
 
@@ -213,6 +224,7 @@ function pot(ctx, r = 0.26, h = 0.45, color) {
 }
 
 function sway(ctx, obj, amt = 0.03, speed = 0.8) {
+  obj.userData.animated = true;
   const ph = ctx.rand() * 10;
   ctx.animate((dt, t) => {
     obj.rotation.z = Math.sin(t * speed + ph) * amt;
@@ -320,6 +332,7 @@ function swingChair(item, ctx) {
   g.add(pole);
   const hang = new THREE.Group();
   hang.position.set(0, 2.58, 0);
+  hang.userData.animated = true;
   g.add(hang);
   hang.add(cyl(0.01, 0.01, 0.42, metal, 0, -0.21, 0, 4));
   const egg = new THREE.Mesh(
@@ -362,6 +375,7 @@ function hammock(item, ctx) {
   }
   const sling = new THREE.Group();
   sling.position.y = 1.5;
+  sling.userData.animated = true;
   g.add(sling);
   const plane = new THREE.PlaneGeometry(2.2, 0.95, 24, 6);
   const pos = plane.attributes.position;
@@ -407,7 +421,8 @@ function bench(item, ctx) {
 function candle(ctx, x, y, z) {
   const g = new THREE.Group();
   g.add(cyl(0.035, 0.035, 0.12, mat('#f5ecd9', { roughness: 0.9 }), x, y + 0.06, z, 10));
-  const flame = sphere(0.018, glow('#ffb347', 6), x, y + 0.14, z, 8);
+  const flame = sphere(0.018, glow('#ffb347', 2.2), x, y + 0.14, z, 8);
+  flame.userData.animated = true;
   flame.scale.y = 1.8;
   flame.castShadow = false;
   g.add(flame);
@@ -448,7 +463,7 @@ function roundTable(item, ctx) {
 function tableLamp(ctx, y) {
   const g = new THREE.Group();
   g.add(cyl(0.06, 0.08, 0.2, mat('#c9a66b', { roughness: 0.3, metalness: 0.6 }), 0, y + 0.1, 0, 12));
-  const shadeM = mat('#f3e2c3', { emissive: '#ffb35c', emissiveIntensity: 1.2, side: THREE.DoubleSide });
+  const shadeM = mat('#f3e2c3', { emissive: '#ffb35c', emissiveIntensity: 0.75, side: THREE.DoubleSide });
   const s = new THREE.Mesh(geo('tlshade', () => new THREE.CylinderGeometry(0.11, 0.17, 0.2, 20, 1, true)), shadeM);
   s.position.y = y + 0.3;
   g.add(s);
@@ -544,7 +559,7 @@ function bookshelf(item, ctx) {
 
 function fireplace(item, ctx) {
   const g = new THREE.Group();
-  const stone = mat('#8d847a', { roughness: 0.95 });
+  const stone = new THREE.MeshStandardMaterial({ map: TX.stones(), roughness: 0.92 });
   const dark = mat('#17110e', { roughness: 1 });
   const wood = mat(ctx.theme.wood || '#5a3b28', { roughness: 0.55 });
   for (const s of [-1, 1]) g.add(rbox(0.65, 2.3, 0.7, stone, s * 1.075, 1.15, 0, 0.04));
@@ -584,12 +599,12 @@ function floorLamp(item, ctx) {
   const metal = mat('#2d2a26', { roughness: 0.4, metalness: 0.6 });
   g.add(cyl(0.2, 0.22, 0.04, metal, 0, 0.02, 0, 20));
   g.add(cyl(0.018, 0.018, 1.55, metal, 0, 0.8, 0, 8));
-  const shadeM = mat(item.shade || '#f3e2c3', { emissive: '#ffb35c', emissiveIntensity: 1.1, side: THREE.DoubleSide, roughness: 0.9 });
+  const shadeM = mat(item.shade || '#f3e2c3', { emissive: '#ffb35c', emissiveIntensity: 0.75, side: THREE.DoubleSide, roughness: 0.9 });
   const s = new THREE.Mesh(geo('flshade', () => new THREE.CylinderGeometry(0.2, 0.3, 0.36, 24, 1, true)), shadeM);
   s.position.y = 1.65;
   s.castShadow = true;
   g.add(s);
-  const bulb = sphere(0.06, new THREE.MeshBasicMaterial({ color: new THREE.Color('#ffd9a0').multiplyScalar(4) }), 0, 1.56, 0, 10);
+  const bulb = sphere(0.06, new THREE.MeshBasicMaterial({ color: '#fff1d6' }), 0, 1.56, 0, 10);
   bulb.castShadow = false;
   g.add(bulb);
   const light = new THREE.PointLight('#ffc27a', ctx.theme.lampPower ?? 6, 8, 1.8);
@@ -756,6 +771,7 @@ function turntable(item, ctx) {
   g.add(spines);
   g.add(rbox(0.6, 0.08, 0.44, mat('#2a2522', { roughness: 0.4 }), -0.1, 0.66, 0, 0.02));
   const platter = new THREE.Group();
+  platter.userData.animated = true;
   platter.position.set(-0.16, 0.71, 0);
   platter.add(cyl(0.175, 0.175, 0.012, mat('#111', { roughness: 0.25 }), 0, 0, 0, 32));
   const label = cyl(0.06, 0.06, 0.014, mat(ctx.theme.record || '#e76f51'), 0, 0, 0, 16);
@@ -812,17 +828,18 @@ function neonSign(item, ctx) {
   for (const s of [-1, 1]) g.add(cyl(0.04, 0.04, 2.0, post, s * 1.3, 1.0, -0.05, 8));
   g.add(rbox(3.4, 1.25, 0.08, mat('#121218', { roughness: 0.6 }), 0, 2.35, -0.05, 0.03));
   const color = new THREE.Color(item.color || '#ff5fa2');
-  const neonM = new THREE.MeshBasicMaterial({ map: TX.neonText(item.text || 'chill', item.color || '#ff5fa2'), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, color: new THREE.Color(2.4, 2.4, 2.4) });
+  const neonM = new THREE.MeshBasicMaterial({ map: TX.neonText(item.text || 'chill', item.color || '#ff5fa2'), transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
   const sign = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.0), neonM);
   sign.position.set(0, 2.35, 0.0);
+  sign.userData.keep = true;
   g.add(sign);
-  const light = new THREE.PointLight(color, 5, 9, 1.8);
+  const light = new THREE.PointLight(color, 3, 8, 2);
   light.position.set(0, 2.2, 0.8);
   g.add(light);
   ctx.animate((dt, t) => {
     const flick = Math.sin(t * 0.7) > 0.985 ? 0.4 : 1;
-    neonM.color.setScalar(2.4 * flick);
-    light.intensity = 5 * flick;
+    neonM.color.setScalar(flick);
+    light.intensity = 3 * flick;
   });
   return { object: g };
 }
@@ -897,6 +914,7 @@ function cat(item, ctx) {
   const fur = mat(item.color || '#e39b4b', { roughness: 1 });
   const light = mat('#f6e0c4', { roughness: 1 });
   const body = sphere(0.3, fur, 0, 0.16, 0, 18);
+  body.userData.animated = true;
   body.scale.set(1, 0.55, 1.25);
   g.add(body);
   const head = new THREE.Group();
@@ -1006,7 +1024,7 @@ function plant(item, ctx) {
       g.add(box(1.5, 0.04, 1.5, mat('#3b2a20', { roughness: 1 }), 0, 0.54, 0));
     }
     g.add(cyl(0.09 * s, 0.16 * s, 2.7 * s, mat('#6b4a32', { roughness: 0.9 }), 0, 0.5 + 1.35 * s, 0, 10));
-    const cm = [mat('#3a7d44', { flatShading: true }), mat('#57a55a', { flatShading: true }), mat('#2d6a4f', { flatShading: true })];
+    const cm = [mat('#3a7d44', { roughness: 0.85 }), mat('#4f9a52', { roughness: 0.85 }), mat('#2d6a4f', { roughness: 0.85 })];
     for (let i = 0; i < 9; i++) {
       const a = i * 2.4;
       const r = i === 0 ? 0 : 0.6 + ctx.rand() * 0.5;
@@ -1185,6 +1203,7 @@ function door(item, ctx) {
   const frame = mat(ctx.theme.trimWood || '#2a1c13', { roughness: 0.6 });
   g.add(rbox(0.12, 2.3, 0.16, frame, -0.58, 1.15, 0.02), rbox(0.12, 2.3, 0.16, frame, 0.58, 1.15, 0.02), rbox(1.28, 0.14, 0.16, frame, 0, 2.3, 0.02));
   const pivot = new THREE.Group();
+  pivot.userData.animated = true; // the maid swings it open
   pivot.position.set(-0.52, 0, 0.02);
   const panel = rbox(1.04, 2.2, 0.06, wood, 0.52, 1.1, 0, 0.02);
   pivot.add(panel);
@@ -1210,7 +1229,6 @@ export function leftBookMesh(id) {
     const pages = mat('#efe6d2');
     const m = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.04, 0.24), [pages, side, cover, side, pages, pages]);
     m.position.y = 0.022;
-    m.castShadow = true;
     g.add(m);
   }
   g.rotation.y = (TX.hashString(id) % 628) / 100;

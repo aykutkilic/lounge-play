@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { leatherCover, leatherPlain, marbled, pageEdges } from './textures.js';
 import { coverTexture } from './furniture.js';
+import { whenRig, makeRig, poseRig, skinMaterial, SHAPES, PALM, PINCH } from './hands.js';
 import { openBook, saveProgress } from './library.js';
 
 // First-person reading: a leather-bound book held in your hands, pages you turn
@@ -23,23 +24,40 @@ function setMap(mesh, tex) {
   mesh.material.emissiveMap = tex;
 }
 
-function makeHand(color, side) {
-  const g = new THREE.Group();
-  const m = new THREE.MeshStandardMaterial({ color, roughness: 0.75 });
-  const palm = new THREE.Mesh(new THREE.SphereGeometry(0.026, 16, 12), m);
-  palm.scale.set(1, 1.3, 0.55);
-  palm.position.set(side * 0.014, 0, -0.012);
-  const thumb = new THREE.Mesh(new THREE.CapsuleGeometry(0.009, 0.028, 4, 8), m);
-  thumb.position.set(-side * 0.008, 0.004, 0.006);
-  thumb.rotation.z = side * 1.25;
-  const fingers = new THREE.Mesh(new THREE.CapsuleGeometry(0.012, 0.03, 4, 8), m);
-  fingers.position.set(side * 0.006, 0.022, -0.012);
-  fingers.rotation.z = side * 0.4;
-  const arm = new THREE.Mesh(new THREE.CapsuleGeometry(0.022, 0.2, 6, 12), m);
-  arm.position.set(side * 0.05, -0.11, -0.03);
-  arm.rotation.z = side * 0.45;
-  g.add(palm, thumb, fingers, arm);
-  return g;
+// How a hand holds the book (hand space → book space): fingers reaching round
+// behind the board, the thumb tipped forward onto the page, the wrist low.
+const HOLD_Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.45, 0.42, 0.1, 'YXZ'));
+const PINCH_Q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0.9, 0.2, 0.35, 'YXZ'));
+
+// One arm: the rigged hand coming out of a shirt sleeve with a white cuff.
+// The left arm is the right one in a mirror (outer.scale.x = -1), so every
+// pose below is worked out for the right hand.
+function makeArm(side, shirtColor, skinColor) {
+  const outer = new THREE.Group();
+  outer.scale.x = side;
+  const wrist = new THREE.Group();
+  outer.add(wrist);
+  const arm = { outer, wrist, side, rig: null, materials: [] };
+  const skin = skinMaterial(skinColor);
+  const shirt = new THREE.MeshStandardMaterial({ color: shirtColor, roughness: 0.8, side: THREE.DoubleSide });
+  const cuffM = new THREE.MeshStandardMaterial({ color: '#f6f2ea', roughness: 0.85, side: THREE.DoubleSide });
+  arm.materials.push(skin, shirt, cuffM);
+  // the forearm leaves the wrist toward the elbow (+z in hand space), dropping a little
+  const along = new THREE.Vector3(0, -0.22, 1).normalize();
+  const up = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), along);
+  const sleeve = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.042, 0.46, 20, 1, true), shirt);
+  sleeve.quaternion.copy(up);
+  sleeve.position.copy(along).multiplyScalar(0.27);
+  const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.031, 0.034, 0.045, 20, 1, true), cuffM);
+  cuff.quaternion.copy(up);
+  cuff.position.copy(along).multiplyScalar(0.035);
+  wrist.add(sleeve, cuff);
+  arm.geometries = [sleeve.geometry, cuff.geometry];
+  whenRig(() => {
+    arm.rig = makeRig(skin);
+    if (arm.rig) wrist.add(arm.rig.root);
+  });
+  return arm;
 }
 
 export class Reader {
@@ -62,7 +80,7 @@ export class Reader {
 
   // ---------------------------------------------------------------- open / close
 
-  async open(book, { handColor, eye, yaw }) {
+  async open(book, { handColor, skinColor = '#e0ac8a', eye, yaw }) {
     if (this.active) return;
     this.active = true;
     this.closing = false;
@@ -88,7 +106,7 @@ export class Reader {
       return;
     }
     this.pages = this.pdf.pages;
-    this.build(handColor);
+    this.build(handColor, skinColor);
     this.spread = Math.min(Math.floor((book.lastPage || 1) / 2), Math.floor(this.pages / 2));
     this.showSpread();
     this.rig.visible = true;
@@ -121,7 +139,7 @@ export class Reader {
     return things[0];
   }
 
-  build(handColor) {
+  build(handColor, skinColor) {
     const book = this.book;
     const H = PAGE_H;
     const W = H * Math.min(1, Math.max(0.5, book.pageW / book.pageH));
@@ -192,11 +210,13 @@ export class Reader {
     group.add(ribbon);
 
     this.hands = [-1, 1].map((side) => {
-      const h = makeHand(handColor, side);
-      h.scale.setScalar(0.85);
-      h.traverse((o) => { if (o.material) this.track(o.material, o.geometry); });
-      group.add(h);
-      return { mesh: h, side, rest: new THREE.Vector3(side * (W + 0.008), -H * 0.22, 0.004) };
+      const arm = makeArm(side, handColor, skinColor);
+      this.track(...arm.materials, ...arm.geometries);
+      group.add(arm.outer);
+      // where the palm rests against the book's outer edge (book space, before mirroring)
+      arm.rest = new THREE.Vector3(side * (W + 0.018), -H * 0.16, -0.004);
+      arm.wrist.quaternion.copy(HOLD_Q);
+      return arm;
     });
 
     this.layoutBlocks();
@@ -684,28 +704,38 @@ export class Reader {
       }
     }
 
-    // hands: rest on the boards; one reaches for the page corner while turning,
-    // and both hold the sheet's bottom corners while it's unfolded
-    for (const hand of this.hands) {
-      const goal = hand.rest.clone();
-      goal.z = (hand.side > 0 ? this.right.depth : this.left.depth) * 0.2 + 0.003;
-      if (hand.side < 0) goal.applyAxisAngle(new THREE.Vector3(0, 1, 0), this.left.g.rotation.y);
-      let rot = 0;
-      if (this.flip && this.flipCorner && Math.sign(this.flip.dir) === hand.side) {
-        const p = hand.side > 0 ? this.flip.p : 1 - this.flip.p;
-        const w = Math.min(1, p * 5) * (1 - smooth(0.75, 1, p));
-        goal.lerp(this.flipCorner, w);
-        rot = w * 0.6;
+    // hands: holding the book by its outer edges; one reaches for the page
+    // corner and pinches it while turning, and both hold the sheet's bottom
+    // corners while it's unfolded
+    const mirror = (p, side) => p.set(p.x * side, p.y, p.z); // book space ↔ this arm's (mirrored) space
+    for (const arm of this.hands) {
+      const side = arm.side;
+      const edge = arm.rest.clone();
+      edge.z += (side > 0 ? 0 : this.left.depth) * 0.5;
+      if (side < 0) edge.applyAxisAngle(new THREE.Vector3(0, 1, 0), this.left.g.rotation.y); // rides the cover as it opens
+      mirror(edge, side);
+      const goal = edge.sub(PALM.clone().applyQuaternion(HOLD_Q));
+      const q = HOLD_Q.clone();
+      let pinch = 0;
+      if (this.flip && this.flipCorner && Math.sign(this.flip.dir) === side) {
+        const p = side > 0 ? this.flip.p : 1 - this.flip.p;
+        pinch = Math.min(1, p * 5) * (1 - smooth(0.75, 1, p));
+        const corner = mirror(this.flipCorner.clone(), side);
+        const at = corner.sub(PINCH.clone().applyQuaternion(PINCH_Q));
+        goal.lerp(at, pinch);
+        q.slerp(PINCH_Q, pinch);
       }
       if (this.sheet && this.sheet.handBlend > 0) {
         const sh = this.sheet;
-        const c = new THREE.Vector3((hand.side * sh.SW) / 2, -sh.SH / 2 + 0.02, 0);
+        const c = new THREE.Vector3((side * sh.SW) / 2 + side * 0.01, -sh.SH / 2 + 0.03, -0.004);
         sh.root.localToWorld(c);
         this.group.worldToLocal(c);
-        goal.lerp(c, sh.handBlend);
+        mirror(c, side);
+        goal.lerp(c.sub(PALM.clone().applyQuaternion(HOLD_Q)), sh.handBlend);
       }
-      hand.mesh.position.lerp(goal, Math.min(1, dt * 14));
-      hand.mesh.rotation.y = THREE.MathUtils.lerp(hand.mesh.rotation.y, -hand.side * rot, Math.min(1, dt * 10));
+      arm.wrist.position.lerp(goal, Math.min(1, dt * 14));
+      arm.wrist.quaternion.slerp(q, Math.min(1, dt * 12));
+      if (arm.rig) poseRig(arm.rig, SHAPES.hold, SHAPES.pinch, pinch);
     }
   }
 }

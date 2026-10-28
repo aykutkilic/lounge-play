@@ -1,9 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { ROOMS, ROOM_BY_ID, AVATARS, COLORS, EMOJIS, BURST_EMOJIS, roomMenu, maidPlan } from './shared.js';
 import { THEMES } from './themes.js';
 import { buildWorld } from './world.js';
@@ -13,6 +9,7 @@ import { Net } from './net.js';
 import { TRANSPORT } from './config.js';
 import { Reader } from './reader.js';
 import { FirstPerson } from './firstperson.js';
+import { SKIN_TONES } from './hands.js';
 import { listBooks, addFiles, removeBook, libraryBook } from './library.js';
 import { CATALOG } from './catalog.js';
 import { leftBookMesh } from './furniture.js';
@@ -29,13 +26,33 @@ const QUICK = ['👋', '😊', '😂', '🥰', '👍', '👏', '❤️', '✨', 
 // ---------------------------------------------------------------- renderer
 
 const canvas = $('scene');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
-const pixelRatio = Math.min(devicePixelRatio, 2);
-renderer.setPixelRatio(pixelRatio);
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
 renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap;
-renderer.toneMapping = THREE.NeutralToneMapping;
+renderer.shadowMap.autoUpdate = false; // the furniture doesn't move: draw its shadows once (people get contact shadows)
+renderer.toneMapping = THREE.ACESFilmicToneMapping; // filmic highlights: bulbs and flames roll off instead of clipping
+
+// Resolution adapts to the machine: start sharp, and trade pixels for a
+// steady frame rate if frames get slow (and back again when there's room).
+const quality = { ratio: Math.min(devicePixelRatio, 1.5), max: Math.min(devicePixelRatio, 2), frames: 0, time: 0 };
+renderer.setPixelRatio(quality.ratio);
+function adaptQuality(dt) {
+  quality.frames++;
+  quality.time += dt;
+  if (quality.time < 1.5) return;
+  const ms = (quality.time / quality.frames) * 1000;
+  quality.frames = 0;
+  quality.time = 0;
+  let next = quality.ratio;
+  if (ms > 24) next = Math.max(0.75, quality.ratio - 0.25);
+  else if (ms < 14 && quality.ratio < quality.max) next = Math.min(quality.max, quality.ratio + 0.25);
+  if (next !== quality.ratio) {
+    quality.ratio = next;
+    renderer.setPixelRatio(next);
+    renderer.setSize(innerWidth, innerHeight);
+  }
+}
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 1200);
@@ -51,19 +68,10 @@ controls.maxPolarAngle = 1.36;
 controls.screenSpacePanning = false;
 controls.autoRotateSpeed = 0.35;
 
-const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
-composer.setPixelRatio(pixelRatio);
-composer.setSize(innerWidth, innerHeight);
-composer.addPass(new RenderPass(scene, camera));
-const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.5, 0.5, 1.0);
-composer.addPass(bloom);
-composer.addPass(new OutputPass());
-
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
-  composer.setSize(innerWidth, innerHeight);
 });
 
 function resetCamera() {
@@ -97,6 +105,7 @@ const music = new Music();
 const me = {
   avatar: AVATARS.includes(store.get('avatar')) ? store.get('avatar') : pick(AVATARS),
   color: COLORS.includes(store.get('color')) ? store.get('color') : pick(COLORS),
+  skin: SKIN_TONES.includes(store.get('skin')) ? store.get('skin') : SKIN_TONES[1], // your own hands; never sent anywhere
 };
 let current = null; // the room we're in
 let preview = null; // the room shown behind the lobby
@@ -109,9 +118,6 @@ function applyTheme(theme) {
   scene.background = new THREE.Color(theme.background);
   scene.fog = new THREE.Fog(...theme.fog);
   renderer.toneMappingExposure = theme.exposure;
-  bloom.strength = theme.bloom.strength;
-  bloom.radius = theme.bloom.radius;
-  bloom.threshold = theme.bloom.threshold;
 }
 
 const pmrem = new THREE.PMREMGenerator(renderer);
@@ -122,13 +128,9 @@ function showWorld(roomId) {
   const world = buildWorld(room, theme);
   scene.add(world.root);
   applyTheme(theme);
-  // outdoor rooms reflect their own sky (water, wet concrete, glossy wood)
-  if (world.envMeshes.length) {
-    const envScene = new THREE.Scene();
-    for (const m of world.envMeshes) envScene.add(m.clone(false));
-    world.env = pmrem.fromScene(envScene, 0.03, 0.1, 1000);
-  }
-  scene.environment = world.env?.texture ?? null;
+  // image-based light: soft ambient and reflections from the room's own sky (or an indoor room)
+  world.env = pmrem.fromScene(world.envScene, 0.04, 0.1, 1000);
+  scene.environment = world.env.texture;
   scene.environmentIntensity = theme.envIntensity ?? 1;
   return { room, theme, world };
 }
@@ -158,6 +160,14 @@ function renderLobby() {
     b.className = c === me.color ? 'on' : '';
     b.setAttribute('aria-label', c);
     b.onclick = () => { me.color = c; store.set('color', c); renderLobby(); };
+    return b;
+  }));
+  $('tonePicker').replaceChildren(...SKIN_TONES.map((tone, i) => {
+    const b = document.createElement('button');
+    b.textContent = ['✋🏻', '✋🏼', '✋🏽', '✋🏾', '✋🏿'][i];
+    b.className = tone === me.skin ? 'on' : '';
+    b.title = 'Your hands, when reading';
+    b.onclick = () => { me.skin = tone; store.set('skin', tone); renderLobby(); };
     return b;
   }));
 }
@@ -284,7 +294,7 @@ function setView(v) {
     controls.enabled = false;
     if (a) a.group.visible = false; // we're behind these eyes
     // face into the room (or the way our seat faces)
-    fp.enter(a?.seat ? a.seat.rot : Math.atan2(-(a?.position.x ?? 0), -(a?.position.z ?? 1)));
+    fp.enter(a?.seat ? a.seat.rot : Math.atan2(-(a?.position.x ?? 0), -(a?.position.z ?? 1)), a);
   } else {
     fp.exit();
     if (a) a.group.visible = true;
@@ -583,7 +593,6 @@ const reader = new Reader({
     $('bagBtn').hidden = false;
     controls.enabled = view === 'overview';
     if (current) {
-      bloom.strength = current.theme.bloom.strength;
       const a = mine();
       if (a) a.group.visible = view === 'overview';
       $('standBtn').hidden = !a?.seat;
@@ -683,7 +692,7 @@ function beginReading(book) {
   const a = mine();
   const seat = a.seat;
   const fwd = new THREE.Vector3(Math.sin(seat.rot), 0, Math.cos(seat.rot));
-  const eye = fp.eye(a).addScaledVector(fwd, 0.06);
+  const eye = fp.eyeOf(a).addScaledVector(fwd, 0.06);
   document.activeElement?.blur?.(); // keys belong to the book now (not the volume slider or file picker)
   fp.keys.clear();
   controls.enabled = false;
@@ -694,9 +703,8 @@ function beginReading(book) {
   $('bagBtn').hidden = true;
   $('pageLabel').textContent = '…';
   $('unfoldBtn').hidden = true;
-  bloom.strength = current.theme.bloom.strength * 0.35;
   net.send({ t: 'reading', on: true });
-  reader.open(book, { handColor: me.color, eye, yaw: seat.rot });
+  reader.open(book, { handColor: me.color, skinColor: me.skin, eye, yaw: seat.rot });
 }
 
 $('prevPage').onclick = () => reader.turn(-1);
@@ -948,29 +956,42 @@ function simulate(dt) {
   else if (!fp.active) controls.update(dt);
 }
 
-// First-person steps move our avatar locally; others get our position a few times a second.
+// First-person steps move our avatar locally; others get our position ten times a second.
 const stream = { walking: false, at: 0, x: 0, z: 0 };
 function walk(step, a) {
-  if (step) {
-    if (a.seat || a.pendingSeat) releaseSeat(current.myId);
-    a.moveTo(step.x, step.z);
+  if (step?.standUp) {
+    if (a.seat || a.pendingSeat || a.state === 'hopIn') {
+      const p = a.seat ? a.seat.approach : a.pos;
+      net.send({ t: 'move', x: p.x, z: p.z });
+      a.moveTo(p.x, p.z); // hops up out of the seat (or stops heading for one)
+      releaseSeat(current.myId);
+    }
+  } else if (step) {
+    a.drive(step.x, step.z, step.moving);
     stream.walking = true;
-    if (clock - stream.at > 0.12 && Math.hypot(step.x - stream.x, step.z - stream.z) > 0.04) {
+    if (clock - stream.at > 0.1 && Math.hypot(step.x - stream.x, step.z - stream.z) > 0.03) {
       net.send({ t: 'move', x: step.x, z: step.z });
       Object.assign(stream, { at: clock, x: step.x, z: step.z });
     }
   } else if (stream.walking) {
     stream.walking = false;
-    net.send({ t: 'move', x: a.target.x, z: a.target.z });
-    Object.assign(stream, { at: clock, x: a.target.x, z: a.target.z });
+    net.send({ t: 'move', x: a.pos.x, z: a.pos.z });
+    Object.assign(stream, { at: clock, x: a.pos.x, z: a.pos.z });
   }
 }
 
 function frame(now) {
   requestAnimationFrame(frame);
-  simulate(Math.min(0.05, (now - last) / 1000));
+  const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
-  composer.render();
+  simulate(dt);
+  adaptQuality(dt);
+  const world = (current || preview)?.world;
+  if (world?.shadowsDirty) {
+    renderer.shadowMap.needsUpdate = true;
+    world.shadowsDirty = false;
+  }
+  renderer.render(scene, camera);
 }
 
 renderLobby();

@@ -441,3 +441,91 @@ export function pageEdges() {
   const t = toTexture(c, [1, 6]);
   return t;
 }
+
+// Tileable ripple normals for water: a few sine swells at whole-number
+// frequencies (so the edges wrap), turned into a tangent-space normal map.
+export function waterNormals(size = 256, seed = 31) {
+  const r = rng(seed);
+  const waves = Array.from({ length: 9 }, () => ({
+    kx: Math.round((r() - 0.5) * 16) || 1, ky: Math.round((r() - 0.5) * 16) || 1, a: 0.3 + r(), p: r() * Math.PI * 2,
+  }));
+  const h = new Float32Array(size * size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      let v = 0;
+      for (const w of waves) v += w.a * Math.sin(((w.kx * x + w.ky * y) / size) * Math.PI * 2 + w.p);
+      h[y * size + x] = v;
+    }
+  }
+  const [c, g] = canvas(size);
+  const img = g.createImageData(size, size);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const dx = h[y * size + ((x + 1) % size)] - h[y * size + ((x - 1 + size) % size)];
+      const dy = h[((y + 1) % size) * size + x] - h[((y - 1 + size) % size) * size + x];
+      const len = Math.hypot(dx, dy, 2);
+      const i = (y * size + x) * 4;
+      img.data[i] = ((-dx / len) * 0.5 + 0.5) * 255;
+      img.data[i + 1] = ((-dy / len) * 0.5 + 0.5) * 255;
+      img.data[i + 2] = ((2 / len) * 0.5 + 0.5) * 255;
+      img.data[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.NoColorSpace;
+  return t;
+}
+
+// Soft dark ellipse that grounds people and robots (cheaper than real shadows).
+let blob = null;
+export function blobShadow() {
+  if (blob) return blob;
+  const [c, g] = canvas(128);
+  const grad = g.createRadialGradient(64, 64, 4, 64, 64, 62);
+  grad.addColorStop(0, 'rgba(0,0,0,0.55)');
+  grad.addColorStop(0.6, 'rgba(0,0,0,0.25)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 128, 128);
+  blob = new THREE.CanvasTexture(c);
+  blob.userData.shared = true;
+  return blob;
+}
+
+// Irregular fieldstone with mortar, for the fireplace.
+export function stones(seed = 17) {
+  const [c, g] = canvas(512);
+  const r = rng(seed);
+  g.fillStyle = '#4e4741';
+  g.fillRect(0, 0, 512, 512);
+  let y = 0;
+  while (y < 512) {
+    const h = 34 + r() * 30;
+    let x = -r() * 40;
+    while (x < 512) {
+      const w = 50 + r() * 70;
+      const tone = 0.42 + r() * 0.2;
+      const base = new THREE.Color().setHSL(0.07 + r() * 0.03, 0.08 + r() * 0.07, tone);
+      g.fillStyle = `#${base.getHexString()}`;
+      g.beginPath();
+      g.roundRect(x + 3, y + 3, w - 6, h - 6, 10);
+      g.fill();
+      // a little light from above, shade below: each stone sits proud of the mortar
+      const sh = g.createLinearGradient(0, y, 0, y + h);
+      sh.addColorStop(0, 'rgba(255,255,255,0.12)');
+      sh.addColorStop(1, 'rgba(0,0,0,0.25)');
+      g.fillStyle = sh;
+      g.fill();
+      for (let k = 0; k < 18; k++) {
+        g.fillStyle = `rgba(${r() > 0.5 ? '255,255,255' : '0,0,0'},${r() * 0.08})`;
+        g.fillRect(x + r() * w, y + r() * h, 2 + r() * 4, 2 + r() * 4);
+      }
+      x += w;
+    }
+    y += h;
+  }
+  const t = toTexture(c, [1, 1]);
+  return t;
+}
