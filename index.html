@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Lounge</title>
+  <meta name="description" content="Cozy 3D lounges: sit, sip, listen together — and talk only in emojis.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☕</text></svg>">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/build/three.module.js",
+        "three/addons/": "./vendor/three/examples/jsm/",
+        "@trystero-p2p/nostr": "./vendor/trystero-nostr/index.mjs",
+        "@trystero-p2p/core": "./vendor/trystero-core/index.mjs",
+        "@noble/secp256k1": "./vendor/noble-secp256k1/index.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+
+  <section id="lobby">
+    <div class="lobby-card">
+      <header>
+        <h1><span>☕</span> Lounge</h1>
+        <p>cozy rooms · shared music · snacks on the house</p>
+        <p class="rule">here, everyone speaks only <b>emoji</b> 🤫✨</p>
+      </header>
+
+      <div class="you">
+        <div class="you-preview" id="youPreview"></div>
+        <div class="you-pickers">
+          <div class="picker" id="avatarPicker" aria-label="Pick your face"></div>
+          <div class="swatches" id="colorPicker" aria-label="Pick your colour"></div>
+        </div>
+      </div>
+
+      <div class="rooms" id="roomList"></div>
+    </div>
+  </section>
+
+  <section id="hud" hidden>
+    <div class="bar top-left">
+      <span id="roomBadge" class="badge"></span>
+      <span class="count">👤 <b id="peopleCount">1</b></span>
+      <button id="leaveBtn" title="Back to the lobby">🚪</button>
+    </div>
+
+    <div class="bar top-right">
+      <span id="nowPlaying" class="now-playing"></span>
+      <button id="muteBtn" title="Mute">🔊</button>
+      <input id="volume" type="range" min="0" max="1" step="0.01" aria-label="Volume">
+      <button id="camBtn" title="Follow me">🎥</button>
+    </div>
+
+    <div id="log" class="log" aria-live="polite"></div>
+
+    <div class="dock">
+      <span id="status" class="status" hidden></span>
+      <button id="standBtn" class="stand" title="Stand up" hidden>🧍</button>
+      <div id="emojiBar" class="emoji-bar"></div>
+      <button id="menuBtn" class="menu-btn" title="Order something">🍽️</button>
+    </div>
+
+    <div id="emojiPanel" class="panel emoji-panel" hidden>
+      <div id="emojiGrid" class="emoji-grid"></div>
+    </div>
+
+    <div id="menuPanel" class="panel menu-panel" hidden>
+      <div class="panel-title">🤖 ➜ 🙂</div>
+      <div id="menuItems" class="menu-grid"></div>
+    </div>
+
+    <div id="hint" class="hint">👆 floor ➜ 🚶 &nbsp;·&nbsp; 👆 seat ➜ 🪑 &nbsp;·&nbsp; drag ➜ 👀 &nbsp;·&nbsp; 🍽️ ➜ ☕🍩</div>
+  </section>
+
+  <div id="toast" class="toast"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

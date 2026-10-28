@@ -1,0 +1,630 @@
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ROOMS, ROOM_BY_ID, AVATARS, COLORS, EMOJIS, BURST_EMOJIS, roomMenu } from './shared.js';
+import { THEMES } from './themes.js';
+import { buildWorld } from './world.js';
+import { Avatar, Waiter, Fx } from './avatar.js';
+import { Music } from './music.js';
+import { Net } from './net.js';
+import { TRANSPORT } from './config.js';
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } },
+};
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+const QUICK = ['👋', '😊', '😂', '🥰', '👍', '👏', '❤️', '✨', '🎶', '☕', '😴', '🤔'];
+
+// ---------------------------------------------------------------- renderer
+
+const canvas = $('scene');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+const pixelRatio = Math.min(devicePixelRatio, 2);
+renderer.setPixelRatio(pixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.toneMapping = THREE.NeutralToneMapping;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 1200);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 5;
+controls.maxDistance = 34;
+controls.minPolarAngle = 0.2;
+controls.maxPolarAngle = 1.36;
+controls.screenSpacePanning = false;
+controls.autoRotateSpeed = 0.35;
+
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+composer.setPixelRatio(pixelRatio);
+composer.setSize(innerWidth, innerHeight);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.5, 0.5, 1.0);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+});
+
+function resetCamera() {
+  const portrait = innerWidth < innerHeight;
+  camera.position.set(11, portrait ? 17 : 11.5, portrait ? 22 : 15.5);
+  controls.target.set(0, 0.6, 0);
+  controls.update();
+}
+
+const cursorRing = new THREE.Mesh(
+  new THREE.RingGeometry(0.3, 0.38, 36),
+  new THREE.MeshBasicMaterial({ color: '#fff4e0', transparent: true, opacity: 0.7, depthWrite: false }),
+);
+cursorRing.rotation.x = -Math.PI / 2;
+cursorRing.renderOrder = 5;
+cursorRing.visible = false;
+scene.add(cursorRing);
+
+const clickPulse = cursorRing.clone();
+clickPulse.material = cursorRing.material.clone();
+clickPulse.visible = false;
+scene.add(clickPulse);
+let pulseT = 1;
+
+// ---------------------------------------------------------------- state
+
+// 'ws' talks to server.js; 'p2p' needs no server (used for the GitHub Pages build). ?net=p2p overrides.
+const transport = new URLSearchParams(location.search).get('net') || TRANSPORT;
+const net = transport === 'p2p' ? new (await import('./p2p.js')).P2PNet() : new Net();
+const music = new Music();
+const me = {
+  avatar: AVATARS.includes(store.get('avatar')) ? store.get('avatar') : pick(AVATARS),
+  color: COLORS.includes(store.get('color')) ? store.get('color') : pick(COLORS),
+};
+let current = null; // the room we're in
+let preview = null; // the room shown behind the lobby
+let selectedRoom = ROOM_BY_ID[location.hash.slice(1)] ? location.hash.slice(1) : ROOMS[0].id;
+let joining = null;
+let follow = false;
+
+function applyTheme(theme) {
+  scene.background = new THREE.Color(theme.background);
+  scene.fog = new THREE.Fog(...theme.fog);
+  renderer.toneMappingExposure = theme.exposure;
+  bloom.strength = theme.bloom.strength;
+  bloom.radius = theme.bloom.radius;
+  bloom.threshold = theme.bloom.threshold;
+}
+
+const pmrem = new THREE.PMREMGenerator(renderer);
+
+function showWorld(roomId) {
+  const room = ROOM_BY_ID[roomId];
+  const theme = THEMES[roomId];
+  const world = buildWorld(room, theme);
+  scene.add(world.root);
+  applyTheme(theme);
+  // outdoor rooms reflect their own sky (water, wet concrete, glossy wood)
+  if (world.envMeshes.length) {
+    const envScene = new THREE.Scene();
+    for (const m of world.envMeshes) envScene.add(m.clone(false));
+    world.env = pmrem.fromScene(envScene, 0.03, 0.1, 1000);
+  }
+  scene.environment = world.env?.texture ?? null;
+  scene.environmentIntensity = theme.envIntensity ?? 1;
+  return { room, theme, world };
+}
+
+function hideWorld(entry) {
+  if (!entry) return;
+  scene.remove(entry.world.root);
+  entry.world.env?.dispose();
+  entry.world.dispose();
+}
+
+// ---------------------------------------------------------------- lobby
+
+function renderLobby() {
+  $('youPreview').textContent = me.avatar;
+  $('youPreview').style.setProperty('--c', me.color);
+  $('avatarPicker').replaceChildren(...AVATARS.map((a) => {
+    const b = document.createElement('button');
+    b.textContent = a;
+    b.className = a === me.avatar ? 'on' : '';
+    b.onclick = () => { me.avatar = a; store.set('avatar', a); renderLobby(); };
+    return b;
+  }));
+  $('colorPicker').replaceChildren(...COLORS.map((c) => {
+    const b = document.createElement('button');
+    b.style.background = c;
+    b.className = c === me.color ? 'on' : '';
+    b.setAttribute('aria-label', c);
+    b.onclick = () => { me.color = c; store.set('color', c); renderLobby(); };
+    return b;
+  }));
+}
+
+function renderRooms(counts = {}) {
+  $('roomList').replaceChildren(...ROOMS.map((r) => {
+    const card = document.createElement('button');
+    card.className = `room-card room-${r.id}${r.id === selectedRoom ? ' selected' : ''}`;
+    card.innerHTML = `
+      <span class="room-emoji">${r.emoji}</span>
+      <span class="room-text"><b>${r.name}</b><small>${r.tagline}</small></span>
+      <span class="room-count">👤 ${counts[r.id] ?? 0}</span>
+      <span class="room-go">➜</span>`;
+    card.onmouseenter = () => previewRoom(r.id);
+    card.onfocus = () => previewRoom(r.id);
+    card.onclick = () => joinRoom(r.id);
+    return card;
+  }));
+}
+
+async function refreshCounts() {
+  if ($('lobby').hidden) return;
+  try {
+    renderRooms(await net.counts());
+  } catch { /* server restarting */ }
+}
+setInterval(refreshCounts, 3000);
+
+let previewTimer = 0;
+function previewRoom(id) {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => {
+    if (preview?.room.id === id || current) return;
+    selectedRoom = id;
+    document.querySelectorAll('.room-card').forEach((c) => c.classList.toggle('selected', c.classList.contains(`room-${id}`)));
+    hideWorld(preview);
+    preview = showWorld(id);
+  }, 180);
+}
+
+function showLobby() {
+  $('hud').hidden = true;
+  $('lobby').hidden = false;
+  joining = null;
+  renderLobby();
+  renderRooms();
+  refreshCounts();
+  if (!preview) preview = showWorld(selectedRoom);
+  resetCamera();
+  controls.autoRotate = true;
+  history.replaceState(null, '', location.pathname);
+}
+
+// ---------------------------------------------------------------- joining
+
+function joinRoom(id) {
+  music.ensure(); // must happen inside the click so the browser allows audio
+  joining = id;
+  document.body.classList.add('busy');
+  net.send({ t: 'join', room: id, avatar: me.avatar, color: me.color });
+}
+
+net.on('open', () => {
+  if (current) net.send({ t: 'join', room: current.room.id, avatar: me.avatar, color: me.color });
+});
+
+net.on('close', () => { if (current) toast('📡💤'); });
+
+net.on('welcome', (msg) => {
+  document.body.classList.remove('busy');
+  const rejoin = current && current.room.id === msg.room;
+  if (!rejoin) {
+    teardownRoom();
+    // the lobby was already showing this room: step straight into it
+    let entry = preview?.room.id === msg.room ? preview : null;
+    if (!entry) {
+      hideWorld(preview);
+      entry = showWorld(msg.room);
+    }
+    preview = null;
+    current = {
+      ...entry,
+      avatars: new Map(),
+      seatOwners: new Map(),
+      fx: new Fx(entry.world.root),
+      myId: msg.id,
+    };
+    if (entry.world.waiter) {
+      current.waiter = new Waiter(entry.world.waiter, current.fx);
+      entry.world.root.add(current.waiter.group);
+    }
+    resetCamera();
+    controls.autoRotate = false;
+    enterHud();
+    music.play(msg.room, current.theme.music, (local) => net.serverNow(local));
+    history.replaceState(null, '', `#${msg.room}`);
+  } else {
+    for (const a of current.avatars.values()) removeAvatar(a.id, true);
+    current.myId = msg.id;
+  }
+  for (const p of msg.peers) addAvatar(p, true);
+  updateCount();
+});
+
+// Clears people, robot and effects; returns the bare world so the lobby can keep showing it.
+function teardownRoom({ keepWorld = false } = {}) {
+  if (!current) return null;
+  const { room, theme, world } = current;
+  for (const a of current.avatars.values()) { world.root.remove(a.group); a.dispose(); }
+  current.fx.clear();
+  if (current.waiter) { world.root.remove(current.waiter.group); current.waiter.dispose(); }
+  current = null;
+  if (keepWorld) return { room, theme, world };
+  hideWorld({ world });
+  return null;
+}
+
+function leaveRoom() {
+  net.send({ t: 'leave' });
+  music.stop();
+  preview = teardownRoom({ keepWorld: true });
+  if (preview) selectedRoom = preview.room.id;
+  closePanels();
+  showLobby();
+}
+
+// ---------------------------------------------------------------- avatars
+
+function addAvatar(peer, quiet = false) {
+  if (!current || current.avatars.has(peer.id)) return;
+  const a = new Avatar(peer, { isMe: peer.id === current.myId, serverNow: () => net.serverNow() });
+  current.avatars.set(peer.id, a);
+  current.world.root.add(a.group);
+  if (peer.seat && current.world.seats.has(peer.seat)) {
+    a.sitAt(current.world.seats.get(peer.seat), true);
+    current.seatOwners.set(peer.seat, peer.id);
+  }
+  if (peer.drink) a.setItem('drink', peer.drink.item, peer.drink.at);
+  if (peer.snack) a.setItem('snack', peer.snack.item, peer.snack.at);
+  if (!quiet) {
+    current.fx.burst('✨', a.position.clone().setY(1.6), 3);
+    log(peer.id, '👋', true);
+  }
+  updateCount();
+}
+
+function removeAvatar(id, quiet = false) {
+  const a = current?.avatars.get(id);
+  if (!a) return;
+  if (!quiet) current.fx.burst('💨', a.position.clone().setY(1.0), 2);
+  releaseSeat(id);
+  current.waiter?.cancelFor(id);
+  current.world.root.remove(a.group);
+  a.dispose();
+  current.avatars.delete(id);
+  updateCount();
+}
+
+function releaseSeat(id) {
+  for (const [seat, owner] of current.seatOwners) if (owner === id) current.seatOwners.delete(seat);
+  if (id === current.myId) $('standBtn').hidden = true;
+}
+
+const mine = () => current?.avatars.get(current.myId);
+
+net.on('joined', ({ peer }) => addAvatar(peer));
+net.on('left', ({ id }) => removeAvatar(id));
+
+net.on('moved', ({ id, x, z }) => {
+  if (!current) return;
+  releaseSeat(id);
+  if (id !== current.myId) current.avatars.get(id)?.moveTo(x, z);
+});
+
+net.on('sat', ({ id, seat }) => {
+  if (!current) return;
+  const s = current.world.seats.get(seat);
+  const a = current.avatars.get(id);
+  if (!s || !a) return;
+  releaseSeat(id);
+  current.seatOwners.set(seat, id);
+  a.sitAt(s);
+  if (id === current.myId) $('standBtn').hidden = false;
+});
+
+net.on('emoji', ({ id, e }) => {
+  const a = current?.avatars.get(id);
+  if (!a) return;
+  a.say(e);
+  if (BURST_EMOJIS.has(e)) current.fx.burst(e, a.position.clone().setY(a.group.position.y + 1.6), 3);
+  log(id, e);
+});
+
+net.on('order', (o) => {
+  if (!current) return;
+  current.waiter?.enqueue(o);
+  if (o.id === current.myId) setStatus(`🤖 ${o.item}`);
+  if (!current.waiter) deliver(o);
+});
+
+function deliver(o) {
+  const a = current?.avatars.get(o.id);
+  if (!a) return;
+  a.setItem(o.kind, o.item, o.at);
+  if (o.id === current.myId) setStatus('');
+}
+
+net.on('finished', ({ id, kind }) => {
+  const a = current?.avatars.get(id);
+  if (!a) return;
+  a.removeItem(kind);
+  current.fx.burst('✨', a.handPosition(kind), 1);
+});
+
+const ERRORS = { 'seat-taken': '🪑❌', full: '🚪🈵', 'slow-down': '⏳🙂', 'no-room': '❓' };
+net.on('error', ({ code, seat }) => {
+  document.body.classList.remove('busy');
+  toast(ERRORS[code] || '⚠️');
+  // p2p: someone else claimed my seat first, so hop back up
+  if (code === 'seat-taken' && seat && mine()?.seat?.id === seat) standUp();
+  if (code === 'full' && joining && !current) joining = null;
+});
+
+// ---------------------------------------------------------------- HUD
+
+function enterHud() {
+  $('lobby').hidden = true;
+  $('hud').hidden = false;
+  const { room, theme } = current;
+  $('roomBadge').textContent = `${room.emoji} ${room.name}`;
+  $('nowPlaying').textContent = `🎵 ${theme.music.title}`;
+  $('log').replaceChildren();
+  $('standBtn').hidden = true;
+  setStatus('');
+  $('menuItems').replaceChildren(...roomMenu(room).map((item) => {
+    const b = document.createElement('button');
+    b.textContent = item;
+    b.onclick = () => { net.send({ t: 'order', item }); closePanels(); };
+    return b;
+  }));
+  const hint = $('hint');
+  hint.classList.remove('gone');
+  clearTimeout(hint.timer);
+  hint.timer = setTimeout(() => hint.classList.add('gone'), 9000);
+}
+
+function updateCount() {
+  if (current) $('peopleCount').textContent = current.avatars.size;
+}
+
+function sendEmoji(e) {
+  if (current) net.send({ t: 'emoji', e });
+}
+
+$('emojiBar').replaceChildren(...QUICK.map((e, i) => {
+  const b = document.createElement('button');
+  b.textContent = e;
+  b.title = i < 9 ? `${i + 1}` : '';
+  b.onclick = () => sendEmoji(e);
+  return b;
+}), (() => {
+  const more = document.createElement('button');
+  more.className = 'more';
+  more.textContent = '➕';
+  more.onclick = () => togglePanel('emojiPanel');
+  return more;
+})());
+
+$('emojiGrid').replaceChildren(...EMOJIS.map((e) => {
+  const b = document.createElement('button');
+  b.textContent = e;
+  b.onclick = () => sendEmoji(e);
+  return b;
+}));
+
+function togglePanel(id) {
+  const el = $(id);
+  const open = el.hidden;
+  closePanels();
+  el.hidden = !open;
+}
+function closePanels() {
+  $('emojiPanel').hidden = true;
+  $('menuPanel').hidden = true;
+}
+
+$('menuBtn').onclick = () => togglePanel('menuPanel');
+$('leaveBtn').onclick = leaveRoom;
+function standUp() {
+  const a = mine();
+  if (!a?.seat) return;
+  const p = a.seat.approach;
+  net.send({ t: 'move', x: p.x, z: p.z });
+  a.moveTo(p.x, p.z);
+  releaseSeat(current.myId);
+}
+$('standBtn').onclick = standUp;
+$('camBtn').onclick = () => {
+  follow = !follow;
+  $('camBtn').classList.toggle('on', follow);
+  if (!follow) { controls.target.set(0, 0.6, 0); }
+};
+
+const vol = $('volume');
+vol.value = store.get('volume', 0.6);
+music.setVolume(Number(vol.value));
+vol.oninput = () => { music.setVolume(Number(vol.value)); store.set('volume', Number(vol.value)); };
+$('muteBtn').onclick = () => {
+  music.setMuted(!music.muted);
+  $('muteBtn').textContent = music.muted ? '🔇' : '🔊';
+};
+
+function log(id, text, arrival = false) {
+  const a = current?.avatars.get(id);
+  if (!a) return;
+  const line = document.createElement('div');
+  line.className = arrival ? 'line arrival' : 'line';
+  const who = document.createElement('span');
+  who.className = 'who';
+  who.textContent = a.emoji;
+  who.style.setProperty('--c', a.color);
+  const what = document.createElement('span');
+  what.textContent = text;
+  line.append(who, what);
+  const box = $('log');
+  box.append(line);
+  while (box.children.length > 7) box.firstChild.remove();
+}
+
+function setStatus(text) {
+  const el = $('status');
+  el.textContent = text;
+  el.hidden = !text;
+}
+
+let toastTimer = 0;
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
+
+addEventListener('keydown', (e) => {
+  if (!current || e.target instanceof HTMLInputElement) return;
+  if (e.key === 'Escape') closePanels();
+  const n = Number(e.key);
+  if (n >= 1 && n <= 9) sendEmoji(QUICK[n - 1]);
+});
+
+// ---------------------------------------------------------------- pointer
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let down = null;
+let hoverEvent = null;
+
+function hitTest(ev) {
+  if (!current) return null;
+  ndc.set((ev.clientX / innerWidth) * 2 - 1, -(ev.clientY / innerHeight) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  for (const h of raycaster.intersectObjects(current.world.pickables, false)) {
+    if (h.object.userData.furniture !== undefined) {
+      const seat = chooseSeat(h.object.userData.furniture, h.point);
+      return seat ? { kind: 'seat', seat } : { kind: 'taken', point: h.point };
+    }
+    if (h.object.userData.floor) return { kind: 'floor', point: h.point };
+  }
+  return null;
+}
+
+function chooseSeat(index, point) {
+  let best = null;
+  let bestD = Infinity;
+  for (const s of current.world.seats.values()) {
+    if (s.index !== index) continue;
+    const owner = current.seatOwners.get(s.id);
+    if (owner !== undefined && owner !== current.myId) continue;
+    const dd = (s.pos.x - point.x) ** 2 + (s.pos.z - point.z) ** 2;
+    if (dd < bestD) { bestD = dd; best = s; }
+  }
+  return best;
+}
+
+// event timestamps (not handler time) so a slow frame between down and up doesn't turn a click into a long-press
+canvas.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY, t: e.timeStamp }; });
+canvas.addEventListener('pointermove', (e) => { hoverEvent = e; });
+canvas.addEventListener('pointerleave', () => { hoverEvent = null; cursorRing.visible = false; });
+canvas.addEventListener('pointerup', (e) => {
+  if (!down) return;
+  const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+  const quick = e.timeStamp - down.t < 600;
+  down = null;
+  if (moved > 6 || !quick || !current) return;
+  closePanels();
+  const hit = hitTest(e);
+  if (!hit) return;
+  const a = mine();
+  if (hit.kind === 'seat') {
+    if (a?.seat?.id === hit.seat.id) return;
+    net.send({ t: 'sit', seat: hit.seat.id });
+    pulseAt(hit.seat.pos);
+  } else if (hit.kind === 'taken') {
+    toast('🪑❌');
+  } else {
+    const { hw, hd } = current.world.bounds;
+    const x = THREE.MathUtils.clamp(hit.point.x, -hw, hw);
+    const z = THREE.MathUtils.clamp(hit.point.z, -hd, hd);
+    net.send({ t: 'move', x, z });
+    a?.moveTo(x, z);
+    releaseSeat(current.myId);
+    pulseAt(new THREE.Vector3(x, 0, z));
+  }
+});
+
+function pulseAt(p) {
+  clickPulse.position.set(p.x, p.y + 0.03, p.z);
+  pulseT = 0;
+}
+
+function updateHover() {
+  if (!hoverEvent || !current || down) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
+  const hit = hitTest(hoverEvent);
+  if (!hit) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
+  canvas.style.cursor = hit.kind === 'taken' ? 'not-allowed' : 'pointer';
+  const p = hit.kind === 'seat' ? hit.seat.pos : hit.point;
+  cursorRing.visible = hit.kind !== 'taken';
+  cursorRing.position.set(p.x, p.y + 0.03, p.z);
+  cursorRing.material.color.set(hit.kind === 'seat' ? '#ffd27a' : '#fff4e0');
+  cursorRing.scale.setScalar(hit.kind === 'seat' ? 1.25 : 1);
+}
+
+// ---------------------------------------------------------------- loop
+
+let last = performance.now();
+let clock = 0;
+let hoverAcc = 0;
+
+function simulate(dt) {
+  clock += dt;
+  const t = clock;
+  const active = current || preview;
+  if (active) active.world.update(dt, t, camera);
+
+  if (current) {
+    for (const a of current.avatars.values()) a.update(dt, t);
+    current.waiter?.update(dt, t, current.avatars, deliver);
+    current.fx.update(dt);
+    const a = mine();
+    if (follow && a) controls.target.lerp(new THREE.Vector3(a.position.x, 0.8, a.position.z), Math.min(1, dt * 3));
+    const { hw, hd } = current.world.bounds;
+    controls.target.x = THREE.MathUtils.clamp(controls.target.x, -hw - 2, hw + 2);
+    controls.target.z = THREE.MathUtils.clamp(controls.target.z, -hd - 2, hd + 2);
+    controls.target.y = THREE.MathUtils.clamp(controls.target.y, 0, 3);
+    hoverAcc += dt;
+    if (hoverAcc > 0.05) { hoverAcc = 0; updateHover(); }
+  }
+
+  if (pulseT < 1) {
+    pulseT = Math.min(1, pulseT + dt * 2.2);
+    clickPulse.visible = pulseT < 1;
+    clickPulse.scale.setScalar(0.6 + pulseT * 1.4);
+    clickPulse.material.opacity = 0.9 * (1 - pulseT);
+  }
+  controls.update(dt);
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  simulate(Math.min(0.05, (now - last) / 1000));
+  last = now;
+  composer.render();
+}
+
+renderLobby();
+showLobby();
+requestAnimationFrame(frame);
