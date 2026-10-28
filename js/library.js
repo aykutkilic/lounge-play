@@ -48,6 +48,10 @@ export async function removeBook(id) {
 
 export async function saveProgress(book, page) {
   book.lastPage = page;
+  if (book.libraryId) {
+    try { localStorage.setItem(`lounge-lib-${book.libraryId}`, String(page)); } catch { /* private mode */ }
+    return;
+  }
   await putBook(book);
 }
 
@@ -112,8 +116,13 @@ export async function addFiles(files) {
 
 const PAPER = '#f6f0e1';
 
-// An open book: renders pages on demand onto paper-coloured canvases.
+// An open book (a PDF from the suitcase, or a book from the library shelf):
+// renders pages on demand onto paper-coloured canvases.
 export async function openBook(book) {
+  return book.catalog ? openGenerated(book) : openPdf(book);
+}
+
+async function openPdf(book) {
   const task = await load(book.blob);
   const doc = await task.promise;
   const sizes = new Map();
@@ -124,7 +133,39 @@ export async function openBook(book) {
     }
     return sizes.get(n);
   };
+  const draw = async (n, scale) => {
+    const page = await doc.getPage(n);
+    const vp = page.getViewport({ scale });
+    const tmp = document.createElement('canvas');
+    tmp.width = Math.ceil(vp.width);
+    tmp.height = Math.ceil(vp.height);
+    await page.render({ canvas: tmp, viewport: vp }).promise; // on white, which multiplies away into the paper
+    page.cleanup();
+    return tmp;
+  };
+  return bookApi(book, doc.numPages, size, draw, () => task.destroy());
+}
 
+// Library books are typeset / drawn right here in the browser.
+function openGenerated(book) {
+  const pages = book.catalog.build();
+  const size = async (n) => ({ w: pages[n - 1].w, h: pages[n - 1].h });
+  const draw = async (n, scale) => {
+    const p = pages[n - 1];
+    const tmp = document.createElement('canvas');
+    tmp.width = Math.ceil(p.w * scale);
+    tmp.height = Math.ceil(p.h * scale);
+    const g = tmp.getContext('2d');
+    g.fillStyle = '#ffffff';
+    g.fillRect(0, 0, tmp.width, tmp.height);
+    g.scale(scale, scale);
+    p.draw(g);
+    return tmp;
+  };
+  return bookApi(book, pages.length, size, draw, () => {});
+}
+
+function bookApi(book, pageCount, size, draw, close) {
   // Pages much bigger than the book (posters, maps, landscape spreads) are
   // folded into it; this says into how many panels.
   const folds = (s) => {
@@ -136,16 +177,10 @@ export async function openBook(book) {
   // Draws page n onto `canvas` (whose aspect is the book page's), fitted and
   // printed onto paper. Fold-outs get crease marks.
   async function renderInto(n, canvas, { fit = 'page' } = {}) {
-    const page = await doc.getPage(n);
     const s = await size(n);
     const W = canvas.width;
     const H = canvas.height;
-    const scale = fit === 'page' ? Math.min(W / s.w, H / s.h) : W / s.w;
-    const vp = page.getViewport({ scale });
-    const tmp = document.createElement('canvas');
-    tmp.width = Math.ceil(vp.width);
-    tmp.height = Math.ceil(vp.height);
-    await page.render({ canvas: tmp, viewport: vp }).promise; // on white, which multiplies away into the paper
+    const tmp = await draw(n, fit === 'page' ? Math.min(W / s.w, H / s.h) : W / s.w);
     const g = canvas.getContext('2d');
     g.fillStyle = PAPER;
     g.fillRect(0, 0, W, H);
@@ -153,8 +188,6 @@ export async function openBook(book) {
     const y = (H - tmp.height) / 2;
     // multiply = the ink soaks into the paper colour instead of sitting on white
     g.globalCompositeOperation = 'multiply';
-    g.fillStyle = '#ffffff';
-    g.fillRect(x, y, tmp.width, tmp.height);
     g.drawImage(tmp, x, y);
     g.globalCompositeOperation = 'source-over';
     const f = folds(s);
@@ -170,12 +203,10 @@ export async function openBook(book) {
       g.textBaseline = 'bottom';
       g.fillText('🗺️', W - W * 0.04, H - H * 0.02);
     }
-    page.cleanup();
   }
 
   return {
-    doc,
-    pages: doc.numPages,
+    pages: pageCount,
     size,
     folds,
     paper: PAPER,
@@ -190,6 +221,18 @@ export async function openBook(book) {
       await renderInto(n, c, { fit: 'width' });
       return c;
     },
-    close() { task.destroy(); },
+    close,
+  };
+}
+
+// A library book as the reader expects it. Where you got to is remembered on
+// this device (library books aren't kept in your suitcase).
+export function libraryBook(id, entry) {
+  const pages = entry.build();
+  let lastPage = 1;
+  try { lastPage = Number(localStorage.getItem(`lounge-lib-${id}`)) || 1; } catch { /* private mode */ }
+  return {
+    id: `lib:${id}`, libraryId: id, catalog: entry, name: entry.title, pages: pages.length,
+    pageW: pages[0].w, pageH: pages[0].h, leather: entry.leather, lastPage,
   };
 }

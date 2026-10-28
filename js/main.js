@@ -4,15 +4,18 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
-import { ROOMS, ROOM_BY_ID, AVATARS, COLORS, EMOJIS, BURST_EMOJIS, roomMenu } from './shared.js';
+import { ROOMS, ROOM_BY_ID, AVATARS, COLORS, EMOJIS, BURST_EMOJIS, roomMenu, maidPlan } from './shared.js';
 import { THEMES } from './themes.js';
 import { buildWorld } from './world.js';
-import { Avatar, Waiter, Fx } from './avatar.js';
+import { Avatar, Waiter, Fx, Maid } from './avatar.js';
 import { Music } from './music.js';
 import { Net } from './net.js';
 import { TRANSPORT } from './config.js';
 import { Reader } from './reader.js';
-import { listBooks, addFiles, removeBook } from './library.js';
+import { FirstPerson } from './firstperson.js';
+import { listBooks, addFiles, removeBook, libraryBook } from './library.js';
+import { CATALOG } from './catalog.js';
+import { leftBookMesh } from './furniture.js';
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -99,7 +102,8 @@ let current = null; // the room we're in
 let preview = null; // the room shown behind the lobby
 let selectedRoom = ROOM_BY_ID[location.hash.slice(1)] ? location.hash.slice(1) : ROOMS[0].id;
 let joining = null;
-let follow = false;
+let view = 'first'; // 'first' = through your own eyes · 'overview' = the dollhouse view
+const fp = new FirstPerson(camera);
 
 function applyTheme(theme) {
   scene.background = new THREE.Color(theme.background);
@@ -245,18 +249,51 @@ net.on('welcome', (msg) => {
       current.waiter = new Waiter(entry.world.waiter, current.fx);
       entry.world.root.add(current.waiter.group);
     }
-    resetCamera();
+    current.books = new Map();
+    current.leftMeshes = new Map();
+    if (entry.world.door) {
+      current.maid = new Maid(entry.world.door);
+      entry.world.root.add(current.maid.group);
+    }
     controls.autoRotate = false;
     enterHud();
-    music.play(msg.room, current.theme.music, (local) => net.serverNow(local));
+    music.play(msg.room, current.theme.music);
     history.replaceState(null, '', `#${msg.room}`);
+    for (const p of msg.peers) addAvatar(p, true);
+    for (const b of msg.books || []) applyBook(b);
+    setView(view);
   } else {
+    for (const id of [...current.books.keys()]) applyBook({ id, mode: null });
+    for (const b of msg.books || []) applyBook(b);
     for (const a of current.avatars.values()) removeAvatar(a.id, true);
     current.myId = msg.id;
+    for (const p of msg.peers) addAvatar(p, true);
+    if (view === 'first' && mine()) mine().group.visible = false;
   }
-  for (const p of msg.peers) addAvatar(p, true);
   updateCount();
 });
+
+// Switch between seeing through your own eyes and the bird's-eye dollhouse.
+function setView(v) {
+  view = v;
+  const a = mine();
+  $('camBtn').textContent = v === 'first' ? '🏠' : '👀';
+  $('camBtn').title = v === 'first' ? 'Bird’s-eye view' : 'First-person view';
+  if (!current || reader.active) return;
+  if (v === 'first') {
+    controls.enabled = false;
+    if (a) a.group.visible = false; // we're behind these eyes
+    // face into the room (or the way our seat faces)
+    fp.enter(a?.seat ? a.seat.rot : Math.atan2(-(a?.position.x ?? 0), -(a?.position.z ?? 1)));
+  } else {
+    fp.exit();
+    if (a) a.group.visible = true;
+    controls.enabled = true;
+    camera.fov = 40;
+    camera.updateProjectionMatrix();
+    resetCamera();
+  }
+}
 
 // Clears people, robot and effects; returns the bare world so the lobby can keep showing it.
 function teardownRoom({ keepWorld = false } = {}) {
@@ -265,6 +302,8 @@ function teardownRoom({ keepWorld = false } = {}) {
   for (const a of current.avatars.values()) { world.root.remove(a.group); a.dispose(); }
   current.fx.clear();
   if (current.waiter) { world.root.remove(current.waiter.group); current.waiter.dispose(); }
+  if (current.maid) { world.root.remove(current.maid.group); current.maid.dispose(); }
+  for (const id of [...current.books.keys()]) applyBook({ id, mode: null });
   current = null;
   if (keepWorld) return { room, theme, world };
   hideWorld({ world });
@@ -273,7 +312,12 @@ function teardownRoom({ keepWorld = false } = {}) {
 
 function leaveRoom() {
   pendingBook = null;
+  pendingTake = null;
   if (reader.active) reader.finish();
+  fp.exit();
+  controls.enabled = true;
+  camera.fov = 40;
+  camera.updateProjectionMatrix();
   net.send({ t: 'leave' });
   music.stop();
   preview = teardownRoom({ keepWorld: true });
@@ -286,7 +330,7 @@ function leaveRoom() {
 
 function addAvatar(peer, quiet = false) {
   if (!current || current.avatars.has(peer.id)) return;
-  const a = new Avatar(peer, { isMe: peer.id === current.myId, serverNow: () => net.serverNow() });
+  const a = new Avatar(peer, { isMe: peer.id === current.myId });
   current.avatars.set(peer.id, a);
   current.world.root.add(a.group);
   if (peer.seat && current.world.seats.has(peer.seat)) {
@@ -339,7 +383,10 @@ net.on('sat', ({ id, seat }) => {
   releaseSeat(id);
   current.seatOwners.set(seat, id);
   a.sitAt(s);
-  if (id === current.myId) $('standBtn').hidden = false;
+  if (id === current.myId) {
+    $('standBtn').hidden = false;
+    fp.auto = null;
+  }
 });
 
 net.on('emoji', ({ id, e }) => {
@@ -366,6 +413,71 @@ function deliver(o) {
 
 net.on('reading', ({ id, on }) => current?.avatars.get(id)?.setReading(on));
 
+// ---------------------------------------------------------------- the library
+
+let pendingTake = null;
+
+// A library book changed hands: on the shelf (mode null), being read, or left lying somewhere.
+function applyBook({ id, by, mode, x, z }) {
+  const lib = current?.world.library.get(id);
+  if (!lib) return;
+  if (mode) current.books.set(id, { by, mode, x, z });
+  else current.books.delete(id);
+  lib.mesh.visible = !mode;
+  let lying = current.leftMeshes.get(id);
+  if (mode === 'left') {
+    if (!lying) {
+      lying = leftBookMesh(id);
+      lying.traverse((o) => { if (o.isMesh) { o.userData.libraryBook = id; current.world.pickables.push(o); } });
+      current.world.root.add(lying);
+      current.leftMeshes.set(id, lying);
+    }
+    lying.position.set(x, 0, z);
+    lying.visible = true;
+  } else if (lying) {
+    current.world.root.remove(lying);
+    lying.traverse((o) => {
+      if (!o.isMesh) return;
+      const i = current.world.pickables.indexOf(o);
+      if (i >= 0) current.world.pickables.splice(i, 1);
+      o.geometry.dispose();
+      for (const m of [].concat(o.material)) if (!m.userData.shared) { m.map?.dispose(); m.dispose(); }
+    });
+    current.leftMeshes.delete(id);
+  }
+  if (mode === 'reading' && by === current.myId && pendingTake === id) {
+    pendingTake = null;
+    startReading(libraryBook(id, CATALOG[id]));
+  }
+}
+
+function takeBook(id) {
+  const b = current.books.get(id);
+  if (b?.mode === 'reading') { toast('📖❌'); return; }
+  pendingTake = id;
+  net.send({ t: 'book', id, mode: 'reading' });
+}
+
+// put a finished library book down on the floor beside wherever we're sitting
+function leaveBook(id) {
+  const a = mine();
+  if (!a) return;
+  const seat = a.seat;
+  const yaw = seat ? seat.rot : a.yaw;
+  const base = seat ? seat.pos : a.position;
+  const x = base.x - Math.cos(yaw) * (seat ? 0.62 : 0.2) + Math.sin(yaw) * 0.25;
+  const z = base.z + Math.sin(yaw) * (seat ? 0.62 : 0.2) + Math.cos(yaw) * 0.25;
+  net.send({ t: 'book', id, mode: 'left', x, z });
+}
+
+net.on('book', (b) => applyBook(b));
+net.on('maid', ({ books }) => {
+  if (!current?.maid) return;
+  current.maid.run(maidPlan(current.room, books), {
+    onPick: (id) => { const m = current?.leftMeshes.get(id); if (m) m.visible = false; },
+  });
+});
+
 net.on('finished', ({ id, kind }) => {
   const a = current?.avatars.get(id);
   if (!a) return;
@@ -373,13 +485,15 @@ net.on('finished', ({ id, kind }) => {
   current.fx.burst('✨', a.handPosition(kind), 1);
 });
 
-const ERRORS = { 'seat-taken': '🪑❌', full: '🚪🈵', 'slow-down': '⏳🙂', 'no-room': '❓' };
+const ERRORS = { 'seat-taken': '🪑❌', full: '🚪🈵', 'slow-down': '⏳🙂', 'no-room': '❓', 'book-taken': '📖❌' };
 net.on('error', ({ code, seat }) => {
   document.body.classList.remove('busy');
   toast(ERRORS[code] || '⚠️');
   // p2p: someone else claimed my seat first, so hop back up
   if (code === 'seat-taken' && seat && mine()?.seat?.id === seat) { if (reader.active) reader.close(); standUp(); }
+  if (code === 'seat-taken' && pendingBook?.libraryId) leaveBook(pendingBook.libraryId);
   if (code === 'seat-taken') pendingBook = null;
+  if (code === 'book-taken') pendingTake = null;
   if (code === 'full' && joining && !current) joining = null;
 });
 
@@ -464,13 +578,14 @@ const reader = new Reader({
   },
   onClose: (ok) => {
     if (!ok) toast('📄❌');
+    if (reader.book?.libraryId && current) leaveBook(reader.book.libraryId);
     $('readerBar').hidden = true;
     $('bagBtn').hidden = false;
-    controls.enabled = true;
+    controls.enabled = view === 'overview';
     if (current) {
       bloom.strength = current.theme.bloom.strength;
       const a = mine();
-      if (a) a.group.visible = true;
+      if (a) a.group.visible = view === 'overview';
       $('standBtn').hidden = !a?.seat;
       net.send({ t: 'reading', on: false });
     }
@@ -555,7 +670,12 @@ function startReading(book) {
   pendingBook = book;
   if (a.seat || a.pendingSeat) return; // already sitting / on the way: opens once seated
   const seat = findReadingSeat(a);
-  if (!seat) { pendingBook = null; toast('🪑❌'); return; }
+  if (!seat) {
+    if (book.libraryId) leaveBook(book.libraryId);
+    pendingBook = null;
+    toast('🪑❌');
+    return;
+  }
   net.send({ t: 'sit', seat: seat.id });
 }
 
@@ -563,8 +683,9 @@ function beginReading(book) {
   const a = mine();
   const seat = a.seat;
   const fwd = new THREE.Vector3(Math.sin(seat.rot), 0, Math.cos(seat.rot));
-  const eye = seat.pos.clone().add(new THREE.Vector3(0, 0.86, 0)).addScaledVector(fwd, 0.06);
+  const eye = fp.eye(a).addScaledVector(fwd, 0.06);
   document.activeElement?.blur?.(); // keys belong to the book now (not the volume slider or file picker)
+  fp.keys.clear();
   controls.enabled = false;
   cursorRing.visible = false;
   a.group.visible = false; // we're looking out of these eyes now
@@ -592,11 +713,7 @@ function standUp() {
   releaseSeat(current.myId);
 }
 $('standBtn').onclick = standUp;
-$('camBtn').onclick = () => {
-  follow = !follow;
-  $('camBtn').classList.toggle('on', follow);
-  if (!follow) { controls.target.set(0, 0.6, 0); }
-};
+$('camBtn').onclick = () => setView(view === 'first' ? 'overview' : 'first');
 
 const vol = $('volume');
 vol.value = store.get('volume', 0.6);
@@ -646,7 +763,14 @@ addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closePanels();
   const n = Number(e.key);
   if (n >= 1 && n <= 9) sendEmoji(QUICK[n - 1]);
+  if (fp.active && !reader.active && WALK_KEYS.has(e.code)) {
+    fp.key(e.code, true);
+    e.preventDefault();
+  }
 });
+const WALK_KEYS = new Set(['KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyQ', 'KeyE', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight']);
+addEventListener('keyup', (e) => fp.key(e.code, false));
+addEventListener('blur', () => fp.keys.clear());
 
 // ---------------------------------------------------------------- pointer
 
@@ -660,6 +784,8 @@ function hitTest(ev) {
   ndc.set((ev.clientX / innerWidth) * 2 - 1, -(ev.clientY / innerHeight) * 2 + 1);
   raycaster.setFromCamera(ndc, camera);
   for (const h of raycaster.intersectObjects(current.world.pickables, false)) {
+    if (!shown(h.object)) continue;
+    if (h.object.userData.libraryBook) return { kind: 'library', id: h.object.userData.libraryBook, point: h.point };
     if (h.object.userData.furniture !== undefined) {
       const seat = chooseSeat(h.object.userData.furniture, h.point);
       return seat ? { kind: 'seat', seat } : { kind: 'taken', point: h.point };
@@ -667,6 +793,11 @@ function hitTest(ev) {
     if (h.object.userData.floor) return { kind: 'floor', point: h.point };
   }
   return null;
+}
+
+function shown(o) {
+  for (let p = o; p; p = p.parent) if (!p.visible) return false;
+  return true;
 }
 
 function chooseSeat(index, point) {
@@ -685,11 +816,20 @@ function chooseSeat(index, point) {
 // event timestamps (not handler time) so a slow frame between down and up doesn't turn a click into a long-press
 canvas.addEventListener('pointerdown', (e) => {
   if (reader.active) { closePanels(); reader.pointerDown(e); return; }
-  down = { x: e.clientX, y: e.clientY, t: e.timeStamp };
+  down = { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, t: e.timeStamp, drag: false };
+  if (fp.active) canvas.setPointerCapture(e.pointerId);
 });
 canvas.addEventListener('pointermove', (e) => {
   if (reader.active) { reader.pointerMove(e); return; }
   hoverEvent = e;
+  if (!down || !fp.active) return;
+  if (!down.drag && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) down.drag = true;
+  if (down.drag) {
+    fp.look(e.clientX - down.lx, e.clientY - down.ly);
+    canvas.style.cursor = 'grabbing';
+  }
+  down.lx = e.clientX;
+  down.ly = e.clientY;
 });
 canvas.addEventListener('dblclick', (e) => reader.doubleClick(e));
 canvas.addEventListener('wheel', (e) => { if (reader.active) { e.preventDefault(); reader.wheel(e); } }, { passive: false });
@@ -698,15 +838,21 @@ canvas.addEventListener('pointerup', (e) => {
   if (reader.active) { reader.pointerUp(e); return; }
   if (!down) return;
   const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
-  const quick = e.timeStamp - down.t < 600;
+  const quick = e.timeStamp - down.t < 1500; // drags are caught by movement; this only rules out deliberate long holds
+  const dragged = down.drag;
   down = null;
-  if (moved > 6 || !quick || !current) return;
+  canvas.style.cursor = '';
+  if (dragged || moved > 6 || !quick || !current) return;
   closePanels();
   const hit = hitTest(e);
   if (!hit) return;
   const a = mine();
-  if (hit.kind === 'seat') {
+  if (hit.kind === 'library') {
+    fp.auto = null;
+    takeBook(hit.id);
+  } else if (hit.kind === 'seat') {
     if (a?.seat?.id === hit.seat.id) return;
+    fp.auto = null;
     net.send({ t: 'sit', seat: hit.seat.id });
     pulseAt(hit.seat.pos);
   } else if (hit.kind === 'taken') {
@@ -715,10 +861,14 @@ canvas.addEventListener('pointerup', (e) => {
     const { hw, hd } = current.world.bounds;
     const x = THREE.MathUtils.clamp(hit.point.x, -hw, hw);
     const z = THREE.MathUtils.clamp(hit.point.z, -hd, hd);
-    net.send({ t: 'move', x, z });
-    a?.moveTo(x, z);
-    releaseSeat(current.myId);
     pulseAt(new THREE.Vector3(x, 0, z));
+    if (fp.active) {
+      fp.walkTo(x, z); // walked step by step (around furniture) in the loop below
+    } else {
+      net.send({ t: 'move', x, z });
+      a?.moveTo(x, z);
+      releaseSeat(current.myId);
+    }
   }
 });
 
@@ -730,13 +880,31 @@ function pulseAt(p) {
 function updateHover() {
   if (!hoverEvent || !current || down || reader.active) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
   const hit = hitTest(hoverEvent);
+  hoverLibrary(hit?.kind === 'library' ? hit.id : null);
   if (!hit) { cursorRing.visible = false; canvas.style.cursor = ''; return; }
+  if (hit.kind === 'library') { cursorRing.visible = false; canvas.style.cursor = 'pointer'; return; }
   canvas.style.cursor = hit.kind === 'taken' ? 'not-allowed' : 'pointer';
   const p = hit.kind === 'seat' ? hit.seat.pos : hit.point;
   cursorRing.visible = hit.kind !== 'taken';
   cursorRing.position.set(p.x, p.y + 0.03, p.z);
   cursorRing.material.color.set(hit.kind === 'seat' ? '#ffd27a' : '#fff4e0');
   cursorRing.scale.setScalar(hit.kind === 'seat' ? 1.25 : 1);
+}
+
+// books you can borrow lift a little and say their title when you point at them
+let hovered = null;
+function hoverLibrary(id) {
+  if (hovered === id) return;
+  const lift = (bookId, k) => {
+    const lib = current?.world.library.get(bookId);
+    if (lib) lib.mesh.scale.setScalar(k);
+    const lying = current?.leftMeshes.get(bookId);
+    if (lying) lying.scale.setScalar(k);
+  };
+  if (hovered) lift(hovered, 1);
+  hovered = id;
+  if (id) lift(id, 1.08);
+  canvas.title = id ? `${CATALOG[id].title} · ${CATALOG[id].magazine ? 'magazine' : CATALOG[id].author}` : '';
 }
 
 // ---------------------------------------------------------------- loop
@@ -754,13 +922,14 @@ function simulate(dt) {
   if (current) {
     for (const a of current.avatars.values()) a.update(dt, t);
     current.waiter?.update(dt, t, current.avatars, deliver);
+    current.maid?.update(dt, t);
     current.fx.update(dt);
     const a = mine();
+    if (fp.active && !reader.active && a) walk(fp.update(dt, t, a, current.world), a);
     if (pendingBook && a?.seat && a.state === 'sitting') {
       beginReading(pendingBook);
       pendingBook = null;
     }
-    if (follow && a) controls.target.lerp(new THREE.Vector3(a.position.x, 0.8, a.position.z), Math.min(1, dt * 3));
     const { hw, hd } = current.world.bounds;
     controls.target.x = THREE.MathUtils.clamp(controls.target.x, -hw - 2, hw + 2);
     controls.target.z = THREE.MathUtils.clamp(controls.target.z, -hd - 2, hd + 2);
@@ -776,7 +945,25 @@ function simulate(dt) {
     clickPulse.material.opacity = 0.9 * (1 - pulseT);
   }
   if (reader.active) reader.update(dt, clock);
-  else controls.update(dt);
+  else if (!fp.active) controls.update(dt);
+}
+
+// First-person steps move our avatar locally; others get our position a few times a second.
+const stream = { walking: false, at: 0, x: 0, z: 0 };
+function walk(step, a) {
+  if (step) {
+    if (a.seat || a.pendingSeat) releaseSeat(current.myId);
+    a.moveTo(step.x, step.z);
+    stream.walking = true;
+    if (clock - stream.at > 0.12 && Math.hypot(step.x - stream.x, step.z - stream.z) > 0.04) {
+      net.send({ t: 'move', x: step.x, z: step.z });
+      Object.assign(stream, { at: clock, x: step.x, z: step.z });
+    }
+  } else if (stream.walking) {
+    stream.walking = false;
+    net.send({ t: 'move', x: a.target.x, z: a.target.z });
+    Object.assign(stream, { at: clock, x: a.target.x, z: a.target.z });
+  }
 }
 
 function frame(now) {

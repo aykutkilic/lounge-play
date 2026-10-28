@@ -90,7 +90,7 @@ export const ROOMS = [
       { type: 'coffeeTable', x: 0, z: -2.4, r: 0 },
       { type: 'bookshelf', x: -8.55, z: -3.4, r: 90 },
       { type: 'bookshelf', x: -8.55, z: 0.4, r: 90 },
-      { type: 'bookshelf', x: -4.6, z: -6.6, r: 0 },
+      { type: 'libraryShelf', x: -4.6, z: -6.6, r: 0, books: ['sonnets', 'poems', 'fables'] },
       { type: 'bookshelf', x: 4.6, z: -6.6, r: 0 },
       { type: 'window', x: 8.95, z: -3.2, r: -90, view: 'night' },
       { type: 'counter', x: 7.6, z: 3.2, r: -90 },
@@ -112,6 +112,8 @@ export const ROOMS = [
       { type: 'painting', x: -8.97, z: 3.9, r: 90, w: 1.6, h: 1.1 },
       { type: 'cat', x: 1.5, z: -4.9, r: 200 },
       { type: 'sideTable', x: -4.7, z: -1.6 },
+      { type: 'magazineRack', x: 2.45, z: -6.35, r: 0, books: ['gazette', 'starlight'] },
+      { type: 'door', x: -8.97, z: 5.2, r: 90 },
     ],
   },
   {
@@ -237,3 +239,53 @@ export const ROOMS = [
 ];
 
 export const ROOM_BY_ID = Object.fromEntries(ROOMS.map((r) => [r.id, r]));
+
+// ---------------------------------------------------------------- library & maid
+
+// The borrowable books/magazines of a room (from shelves and racks in its layout).
+export function libraryIds(room) {
+  return room.layout.flatMap((item) => item.books || []);
+}
+
+export const MAID_SPEED = 1.9; // m/s
+export const MAID_AFTER = 15_000; // a left book waits at least this long before the maid comes
+export const MAID_EVERY = 40_000; // and she visits at most this often
+
+function front(item, d) {
+  const a = ((item.r || 0) * Math.PI) / 180;
+  return { x: item.x + Math.sin(a) * d, z: item.z + Math.cos(a) * d };
+}
+
+// The maid's round: in through the door, pick up each left book (nearest
+// first), put them back where they live, and out again. Server and clients
+// compute the same plan, so everyone sees the same walk with the same timing.
+// books: [{ id, x, z }] -> { stops: [{ kind, x, z, ids, at, wait }], duration } (seconds)
+export function maidPlan(room, books) {
+  const doorItem = room.layout.find((i) => i.type === 'door');
+  if (!doorItem || !books.length) return null;
+  const homes = room.layout.filter((i) => i.books);
+  const door = front(doorItem, 0.8);
+  const stops = [{ kind: 'door', ...door, wait: 1.0 }];
+  let cur = door;
+  const todo = [...books];
+  while (todo.length) {
+    todo.sort((a, b) => Math.hypot(a.x - cur.x, a.z - cur.z) - Math.hypot(b.x - cur.x, b.z - cur.z));
+    const b = todo.shift();
+    stops.push({ kind: 'pick', x: b.x, z: b.z, ids: [b.id], wait: 0.8 });
+    cur = b;
+  }
+  for (const home of homes) {
+    const ids = books.filter((b) => home.books.includes(b.id)).map((b) => b.id);
+    if (ids.length) stops.push({ kind: 'shelve', ...front(home, 0.75), ids, wait: 1.2 });
+  }
+  stops.push({ kind: 'exit', ...door, wait: 0.8 });
+  let t = 0;
+  let prev = stops[0];
+  for (const st of stops) {
+    t += Math.hypot(st.x - prev.x, st.z - prev.z) / MAID_SPEED;
+    st.at = t;
+    t += st.wait;
+    prev = st;
+  }
+  return { stops, duration: t };
+}

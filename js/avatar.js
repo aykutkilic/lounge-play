@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { emojiTexture, bubbleTexture, hashString } from './textures.js';
-import { mat, rbox, sphere, softDot } from './furniture.js';
+import { mat, rbox, sphere, cyl, softDot } from './furniture.js';
 import { ITEMS, ITEM_LIFETIME } from './shared.js';
 
 const WALK_SPEED = 2.6;
@@ -68,13 +68,12 @@ export class Fx {
 // ---------------------------------------------------------------- avatar
 
 export class Avatar {
-  constructor(peer, { isMe, serverNow }) {
+  constructor(peer, { isMe }) {
     this.id = peer.id;
     this.phase = (hashString(String(peer.id)) % 1000) / 100; // ids are numbers (server) or strings (p2p)
     this.emoji = peer.avatar;
     this.color = peer.color;
     this.isMe = isMe;
-    this.serverNow = serverNow;
     this.group = new THREE.Group();
     this.rig = new THREE.Group(); // everything that bobs / sits
     this.group.add(this.rig);
@@ -232,7 +231,7 @@ export class Avatar {
     const s = sprite(emojiTexture(item), 0.34);
     s.position.set(kind === 'drink' ? 0.36 : -0.36, 0.62, 0.22);
     this.rig.add(s);
-    this.items[kind] = { sprite: s, item, at: at ?? this.serverNow(), hot: !!ITEMS[item]?.hot, pop: 0 };
+    this.items[kind] = { sprite: s, item, at: at ?? Date.now(), hot: !!ITEMS[item]?.hot, pop: 0 };
   }
 
   removeItem(kind) {
@@ -349,7 +348,7 @@ export class Avatar {
       const lift = kind === 'drink' ? (cycle < 1.2 ? Math.sin((cycle / 1.2) * Math.PI) : 0) : (cycle > 3.5 && cycle < 4.5 ? Math.sin(((cycle - 3.5) / 1) * Math.PI) : 0);
       const side = kind === 'drink' ? 1 : -1;
       it.sprite.position.set(side * (0.36 - lift * 0.22), 0.62 + lift * 0.5, 0.22 + lift * 0.1);
-      const progress = Math.min(1, (this.serverNow() - it.at) / ITEM_LIFETIME[kind]);
+      const progress = Math.min(1, (Date.now() - it.at) / ITEM_LIFETIME[kind]);
       const size = 0.34 * easeOutBack(it.pop) * (kind === 'snack' ? 1 - progress * 0.55 : 1);
       it.sprite.scale.set(size, size, 1);
       arm.rotation.x = -0.9 - lift * 0.9;
@@ -603,6 +602,126 @@ export class Waiter {
 
   dispose() {
     this.faces.forEach((f) => f.dispose());
+    this.group.traverse((o) => {
+      if (o.geometry && !o.geometry.userData.shared) o.geometry.dispose();
+      if (o.material && !o.material.userData.shared) o.material.dispose();
+    });
+  }
+}
+
+// ---------------------------------------------------------------- the maid
+
+// Comes in through the door now and then, picks up books people left lying
+// around, and puts them back on the shelf. Follows a plan (shared.maidPlan)
+// that every client computes identically, so everyone sees the same round.
+export class Maid {
+  constructor(door) {
+    this.door = door; // { pivot } or null
+    this.group = new THREE.Group();
+    this.rig = new THREE.Group();
+    this.group.add(this.rig);
+    this.group.visible = false;
+    const dress = mat('#2c3550', { roughness: 0.7 });
+    const white = mat('#f7f3ec', { roughness: 0.8 });
+    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.25, 0.36, 8, 16), dress);
+    body.position.y = 0.56;
+    body.castShadow = true;
+    this.rig.add(body);
+    const skirt = new THREE.Mesh(new THREE.ConeGeometry(0.36, 0.42, 20, 1, true), dress);
+    skirt.position.y = 0.3;
+    this.rig.add(skirt);
+    const apron = rbox(0.3, 0.42, 0.04, white, 0, 0.46, 0.25, 0.02);
+    this.rig.add(apron);
+    this.rig.add(rbox(0.34, 0.05, 0.3, white, 0, 0.85, 0.02, 0.02));
+    this.head = sprite(emojiTexture('🐭'), 0.74);
+    this.head.position.y = 1.24;
+    this.rig.add(this.head);
+    const cap = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.035, 8, 20, Math.PI), white);
+    cap.position.set(0, 1.5, 0.05);
+    this.rig.add(cap);
+    // basket
+    const basket = new THREE.Group();
+    basket.position.set(0, 0.62, 0.36);
+    const wicker = mat('#b08452', { roughness: 0.95, side: THREE.DoubleSide });
+    basket.add(new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.13, 0.14, 16, 1, true), wicker));
+    basket.add(cyl(0.13, 0.13, 0.01, wicker, 0, -0.07, 0, 16));
+    const handle = new THREE.Mesh(new THREE.TorusGeometry(0.16, 0.012, 6, 20, Math.PI), wicker);
+    basket.add(handle);
+    this.rig.add(basket);
+    this.basket = basket;
+    this.carried = [];
+    this.plan = null;
+  }
+
+  run(plan, { onPick } = {}) {
+    if (!plan) return;
+    this.plan = plan;
+    this.t = 0;
+    this.done = new Set();
+    this.onPick = onPick;
+    for (const c of this.carried) this.basket.remove(c);
+    this.carried = [];
+    this.group.visible = true;
+    const s = plan.stops[0];
+    this.group.position.set(s.x, 0, s.z);
+  }
+
+  update(dt, t) {
+    const plan = this.plan;
+    let doorOpen = 0;
+    if (plan) {
+      this.t += dt;
+      const now = this.t;
+      if (now >= plan.duration) {
+        this.plan = null;
+        this.group.visible = false;
+      } else {
+        // where along the route are we?
+        const stops = plan.stops;
+        let i = stops.findIndex((s) => now < s.at + s.wait);
+        if (i < 0) i = stops.length - 1;
+        const stop = stops[i];
+        let walking = false;
+        if (now < stop.at && i > 0) {
+          const prev = stops[i - 1];
+          const leave = prev.at + prev.wait;
+          const k = (now - leave) / Math.max(0.001, stop.at - leave);
+          this.group.position.set(prev.x + (stop.x - prev.x) * k, 0, prev.z + (stop.z - prev.z) * k);
+          this.group.rotation.y = Math.atan2(stop.x - prev.x, stop.z - prev.z);
+          walking = true;
+        } else if (!this.done.has(i)) {
+          this.done.add(i);
+          this.arrive(stop);
+        }
+        const bend = !walking && stop.kind !== 'door' && stop.kind !== 'exit' ? Math.sin(Math.min(1, (now - stop.at) / stop.wait) * Math.PI) : 0;
+        this.rig.rotation.x = bend * 0.5;
+        this.rig.position.y = walking ? Math.abs(Math.sin(t * 9)) * 0.05 : 0;
+        this.rig.rotation.z = walking ? Math.sin(t * 9) * 0.05 : 0;
+        // the door swings open as she arrives and as she leaves
+        doorOpen = Math.max(1 - Math.abs(now - 0.5) / 1.4, 1 - Math.abs(now - (plan.duration - 0.6)) / 1.4, 0);
+      }
+    }
+    if (this.door) this.door.pivot.rotation.y = THREE.MathUtils.lerp(this.door.pivot.rotation.y, -1.2 * Math.min(1, doorOpen * 1.6), Math.min(1, dt * 6));
+  }
+
+  arrive(stop) {
+    if (stop.kind === 'pick') {
+      for (const id of stop.ids) {
+        this.onPick?.(id);
+        const book = rbox(0.16, 0.04, 0.22, mat(['#6b2d24', '#2f4a3a', '#8a5a34', '#2c3550'][this.carried.length % 4]), 0, 0.02 + this.carried.length * 0.042, 0, 0.008);
+        book.rotation.y = this.carried.length * 0.4;
+        this.basket.add(book);
+        this.carried.push(book);
+      }
+    } else if (stop.kind === 'shelve') {
+      for (let k = 0; k < stop.ids.length; k++) {
+        const b = this.carried.pop();
+        if (b) this.basket.remove(b);
+      }
+    }
+  }
+
+  dispose() {
     this.group.traverse((o) => {
       if (o.geometry && !o.geometry.userData.shared) o.geometry.dispose();
       if (o.material && !o.material.userData.shared) o.material.dispose();

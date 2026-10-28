@@ -1,12 +1,9 @@
-// Thin WebSocket client: JSON messages, auto-reconnect, and a server clock
-// estimate (used to keep the music in sync for everyone in a room).
+// Thin WebSocket client: JSON messages and auto-reconnect.
 
 export class Net extends EventTarget {
   constructor() {
     super();
     this.ws = null;
-    this.offset = 0;
-    this.bestRtt = Infinity;
     this.pendingJoin = null;
     this.connected = false;
     this.connect();
@@ -18,56 +15,21 @@ export class Net extends EventTarget {
     this.ws = ws;
     ws.onopen = () => {
       this.connected = true;
-      this.bestRtt = Infinity;
       if (this.pendingJoin) ws.send(JSON.stringify(this.pendingJoin));
       this.pendingJoin = null;
-      this.syncClock();
       this.dispatchEvent(new CustomEvent('open'));
     };
     ws.onmessage = (ev) => {
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.t === 'pong') {
-        const now = this.localNow();
-        const rtt = now - msg.c;
-        if (rtt < this.bestRtt) {
-          this.bestRtt = rtt;
-          this.offset = msg.s - (msg.c + rtt / 2);
-        }
-        return;
-      }
       this.dispatchEvent(new CustomEvent(msg.t, { detail: msg }));
     };
     ws.onclose = () => {
       const was = this.connected;
       this.connected = false;
-      clearInterval(this.pingTimer);
       if (was) this.dispatchEvent(new CustomEvent('close'));
       setTimeout(() => this.connect(), 1500);
     };
-  }
-
-  syncClock() {
-    let n = 0;
-    clearInterval(this.pingTimer);
-    const ping = () => this.send({ t: 'ping', c: this.localNow() });
-    ping();
-    this.pingTimer = setInterval(() => {
-      ping();
-      // a quick burst first, then a slow trickle to follow drift
-      if (++n === 6) {
-        clearInterval(this.pingTimer);
-        this.pingTimer = setInterval(() => { this.bestRtt *= 1.5; ping(); }, 15000);
-      }
-    }, 400);
-  }
-
-  localNow() {
-    return performance.timeOrigin + performance.now();
-  }
-
-  serverNow(local = this.localNow()) {
-    return local + this.offset;
   }
 
   send(msg) {

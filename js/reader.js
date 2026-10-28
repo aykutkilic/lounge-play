@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { leatherCover, leatherPlain, marbled, pageEdges } from './textures.js';
+import { coverTexture } from './furniture.js';
 import { openBook, saveProgress } from './library.js';
 
 // First-person reading: a leather-bound book held in your hands, pages you turn
@@ -70,6 +71,7 @@ export class Reader {
     this.yaw = yaw;
     this.returnPos = this.camera.position.clone();
     this.returnQuat = this.camera.quaternion.clone();
+    this.returnFov = this.camera.fov;
     this.camT = 0;
     this.openT = 0;
     this.zoom = 0.6;
@@ -136,7 +138,7 @@ export class Reader {
     this.group = group;
 
     const leather = this.track(leatherPlain(book.leather));
-    const cover = this.track(leatherCover(book.leather, book.name, W / H));
+    const cover = this.track(book.catalog?.magazine ? coverTexture(book.catalog, 512) : leatherCover(book.leather, book.name, W / H));
     this.endpaper = this.track(marbled(book.pages));
     const edgeTex = this.track(pageEdges());
     const boardGeo = this.track(new THREE.BoxGeometry(W + 0.01, H + 0.014, 0.004));
@@ -631,6 +633,8 @@ export class Reader {
       const k = ease(this.camT);
       cam.position.lerpVectors(this.returnPos, this.eye, k);
       cam.quaternion.slerpQuaternions(this.returnQuat, eyeQ, k);
+      cam.fov = THREE.MathUtils.lerp(this.returnFov, 42, k); // the book is framed for a calm, narrow view
+      cam.updateProjectionMatrix();
     }
 
     if (!this.pdf) return;
@@ -647,6 +651,8 @@ export class Reader {
       const k = ease(clamp01((this.closeT - 0.6) / 1.0));
       cam.position.lerpVectors(this.eye, this.returnPos, k);
       cam.quaternion.slerpQuaternions(eyeQ, this.returnQuat, k);
+      cam.fov = THREE.MathUtils.lerp(42, this.returnFov, k);
+      cam.updateProjectionMatrix();
       if (this.closeT > 1.65) { this.finish(); return; }
     }
     this.left.g.rotation.y = Math.PI * (1 - open) * 0.995;

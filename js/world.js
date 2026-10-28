@@ -6,7 +6,7 @@ import { roomMenu } from './shared.js';
 
 // Pieces that hide together with the wall they lean against (dollhouse cutaway).
 // Anything holding a light stays put so the light count never changes mid-frame.
-const WALL_MOUNTED = new Set(['window', 'painting', 'bookshelf']);
+const WALL_MOUNTED = new Set(['window', 'painting', 'bookshelf', 'libraryShelf', 'door']);
 
 const deg = THREE.MathUtils.degToRad;
 
@@ -60,6 +60,9 @@ export function buildWorld(room, theme) {
   // ------------------------------------------------------------ furniture
   const seats = new Map();
   const pickables = [floor];
+  const furniture = [];
+  const library = new Map(); // borrowable book id -> { id, mesh } on its shelf / rack
+  let door = null;
   let waiter = null;
 
   room.layout.forEach((item, index) => {
@@ -73,6 +76,13 @@ export function buildWorld(room, theme) {
     }
     const wall = WALL_MOUNTED.has(item.type) ? nearestWall(walls, item, w, d) : null;
     (wall ? wall.attach : root).add(obj);
+    furniture.push(obj);
+    for (const l of out.library || []) {
+      l.mesh.userData.libraryBook = l.id;
+      library.set(l.id, l);
+      pickables.push(l.mesh);
+    }
+    if (out.door) door = { pivot: out.door };
 
     if (out.seats) {
       const yaw = deg(item.r || 0);
@@ -108,10 +118,46 @@ export function buildWorld(room, theme) {
 
   const bounds = { hw: w / 2 - 0.7, hd: d / 2 - 0.7 };
 
+  // Knee-height obstacles for walking around in first person. One box per mesh
+  // (not per piece) so open structures like the pergola stay walkable.
+  const colliders = [];
+  const aabb = new THREE.Box3();
+  root.updateMatrixWorld(true);
+  for (const obj of furniture) {
+    obj.traverse((o) => {
+      if (!o.isMesh || o.isInstancedMesh) return;
+      if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      aabb.copy(o.geometry.boundingBox).applyMatrix4(o.matrixWorld);
+      if (aabb.min.y > 0.7 || aabb.max.y < 0.08) return;
+      colliders.push({ minX: aabb.min.x, maxX: aabb.max.x, minZ: aabb.min.z, maxZ: aabb.max.z });
+    });
+  }
+
+  // Keeps a body of radius r inside the room and out of the furniture.
+  function resolve(x, z, r = 0.3) {
+    for (let iter = 0; iter < 3; iter++) {
+      for (const b of colliders) {
+        if (x <= b.minX - r || x >= b.maxX + r || z <= b.minZ - r || z >= b.maxZ + r) continue;
+        const left = x - (b.minX - r);
+        const right = b.maxX + r - x;
+        const back = z - (b.minZ - r);
+        const front = b.maxZ + r - z;
+        const m = Math.min(left, right, back, front);
+        if (m === left) x = b.minX - r;
+        else if (m === right) x = b.maxX + r;
+        else if (m === back) z = b.minZ - r;
+        else z = b.maxZ + r;
+      }
+      x = THREE.MathUtils.clamp(x, -bounds.hw, bounds.hw);
+      z = THREE.MathUtils.clamp(z, -bounds.hd, bounds.hd);
+    }
+    return [x, z];
+  }
+
   return {
-    root, seats, pickables, floor, waiter, bounds, envMeshes,
+    root, seats, pickables, floor, waiter, bounds, envMeshes, resolve, library, door,
     update(dt, t, camera) {
-      for (const fn of animators) fn(dt, t);
+      for (const fn of animators) fn(dt, t, camera);
       for (const wall of walls) {
         if (!wall.cutaway) continue;
         const show = (camera.position.x - wall.px) * wall.nx + (camera.position.z - wall.pz) * wall.nz > 0;
@@ -228,6 +274,17 @@ function buildWalls(room, theme, root) {
       }
     }
     walls.push({ ...s, full, attach, stub, cutaway });
+  }
+
+  // A ceiling for walled rooms. It only faces down, so it's there when you look
+  // up in first person but invisible (back-face culled) from the bird's-eye view.
+  if (spec.kind === 'solid') {
+    const tex = TX.woodPlanks({ base: spec.ceiling || '#4a3020', planks: 6, seed: 21, repeat: [2, 1.6] });
+    const ceiling = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshStandardMaterial({ map: tex, roughness: 0.9 }));
+    ceiling.rotation.x = Math.PI / 2;
+    ceiling.position.y = H;
+    ceiling.castShadow = false; // it would otherwise shade the whole room from the key light
+    root.add(ceiling);
   }
 
   if (theme.roof) {
@@ -461,12 +518,18 @@ function buildParticles(room, theme, root, ctx) {
     }));
     pts.frustumCulled = false;
     root.add(pts);
-    ctx.animate((dt, t) => {
+    ctx.animate((dt, t, camera) => {
+      const c = camera.position;
       for (let i = 0; i < n; i++) {
         const s = seeds[i];
-        pos[i * 3] = s.x + Math.sin(t * 0.13 + s.p) * 0.6;
-        pos[i * 3 + 1] = s.y + Math.sin(t * 0.21 + s.p * 2) * 0.35;
-        pos[i * 3 + 2] = s.z + Math.cos(t * 0.11 + s.p) * 0.6;
+        const x = s.x + Math.sin(t * 0.13 + s.p) * 0.6;
+        const y = s.y + Math.sin(t * 0.21 + s.p * 2) * 0.35;
+        const z = s.z + Math.cos(t * 0.11 + s.p) * 0.6;
+        // motes right in front of your eyes would bloom into big orbs, so tuck them away
+        const near = (x - c.x) ** 2 + (y - c.y) ** 2 + (z - c.z) ** 2 < 2.2;
+        pos[i * 3] = x;
+        pos[i * 3 + 1] = near ? -50 : y;
+        pos[i * 3 + 2] = z;
       }
       geo.attributes.position.needsUpdate = true;
     });

@@ -1,8 +1,9 @@
 import { rng, hashString } from './textures.js';
 
-// Generative lo-fi, synthesized live with Web Audio. Every note is derived
-// from (room, bar number) and bars are aligned to the server clock, so
-// everyone in the same lounge hears the same music at the same moment.
+// Generative lo-fi, synthesized live with Web Audio in each listener's own
+// browser. Every note is derived from (room, bar number), so each lounge has
+// its own tune; it starts from the intro when you walk in. Nothing is streamed
+// or synced between people.
 
 const mtof = (m) => 440 * 2 ** ((m - 69) / 12);
 
@@ -93,7 +94,7 @@ export class Music {
     this.master.gain.setTargetAtTime(v * v * 0.9, this.ctx.currentTime, 0.1);
   }
 
-  play(roomId, cfg, serverNow) {
+  play(roomId, cfg) {
     this.ensure();
     this.stop();
     const ctx = this.ctx;
@@ -127,8 +128,8 @@ export class Music {
     wob.start();
 
     const s = {
-      roomId, cfg, serverNow, out, music, send, nodes: [wob], timers: [],
-      seed: hashString(roomId), nextStep: null, bars: new Map(),
+      roomId, cfg, out, music, send, nodes: [wob], timers: [],
+      seed: hashString(roomId), start: ctx.currentTime + 0.15, nextStep: 0, bars: new Map(),
     };
     this.session = s;
 
@@ -166,29 +167,21 @@ export class Music {
     }, 1000);
   }
 
-  // ---------------------------------------------------------------- clock
-
-  audioTimeFor(s, serverSec) {
-    const ts = this.ctx.getOutputTimestamp ? this.ctx.getOutputTimestamp() : null;
-    if (ts && ts.performanceTime) {
-      const serverAtTs = s.serverNow(performance.timeOrigin + ts.performanceTime) / 1000;
-      return ts.contextTime + (serverSec - serverAtTs);
-    }
-    return this.ctx.currentTime + (serverSec - s.serverNow() / 1000);
-  }
+  // ---------------------------------------------------------------- sequencer
 
   schedule(s) {
     if (this.session !== s) return;
     const stepDur = 60 / s.cfg.bpm / 4;
-    const nowSec = s.serverNow() / 1000;
+    const now = this.ctx.currentTime;
     // background tabs only get timer ticks about once a second, so schedule further ahead
-    const horizon = nowSec + (document.hidden ? 1.5 : 0.3);
-    if (s.nextStep === null || s.nextStep * stepDur < nowSec - 0.2) s.nextStep = Math.ceil(nowSec / stepDur);
-    while (s.nextStep * stepDur < horizon) {
+    const horizon = now + (document.hidden ? 1.5 : 0.3);
+    // if we fell far behind (e.g. the tab was asleep), skip ahead instead of playing a burst
+    if (s.start + s.nextStep * stepDur < now - 0.2) s.nextStep = Math.ceil((now - s.start) / stepDur);
+    while (s.start + s.nextStep * stepDur < horizon) {
       const step = s.nextStep++;
       const swing = step % 2 ? s.cfg.swing * stepDur : 0;
-      const time = this.audioTimeFor(s, step * stepDur) + swing;
-      if (time > this.ctx.currentTime - 0.01) this.playStep(s, step, Math.max(time, this.ctx.currentTime), stepDur);
+      const time = s.start + step * stepDur + swing;
+      if (time > now - 0.01) this.playStep(s, step, Math.max(time, now), stepDur);
     }
   }
 

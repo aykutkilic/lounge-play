@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
 import * as TX from './textures.js';
+import { CATALOG } from './catalog.js';
 
 // Every builder takes (item, ctx) and returns { object, seats? }.
 // Builders work in local space: the piece faces +z, seats are { x, y, z }
@@ -504,7 +505,8 @@ function bookshelf(item, ctx) {
   const e = new THREE.Euler();
   const color = new THREE.Color();
   let n = 0;
-  levels.forEach((y) => {
+  levels.forEach((y, li) => {
+    if (li === item.reserveLevel) return; // kept free for the library's own books
     let x = -W / 2 + 0.1;
     const decorAt = ctx.rand() < 0.5 ? -W / 2 + 0.3 + ctx.rand() * (W - 0.6) : 99;
     while (x < W / 2 - 0.12 && n < 160) {
@@ -1062,6 +1064,159 @@ function plant(item, ctx) {
 
 // ---------------------------------------------------------------- registry
 
+// ---------------------------------------------------------------- the library
+
+function spineTexture(color, title) {
+  const c = document.createElement('canvas');
+  c.width = 96;
+  c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = color;
+  g.fillRect(0, 0, 96, 512);
+  const shine = g.createLinearGradient(0, 0, 96, 0);
+  shine.addColorStop(0, 'rgba(0,0,0,0.35)');
+  shine.addColorStop(0.45, 'rgba(255,255,255,0.12)');
+  shine.addColorStop(1, 'rgba(0,0,0,0.4)');
+  g.fillStyle = shine;
+  g.fillRect(0, 0, 96, 512);
+  g.fillStyle = '#d9b45a';
+  for (const y of [28, 40, 472, 484]) g.fillRect(8, y, 80, 4);
+  g.save();
+  g.translate(56, 256);
+  g.rotate(-Math.PI / 2);
+  g.font = 'bold 34px Georgia, serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(title.length > 20 ? `${title.slice(0, 19)}…` : title, 0, 0);
+  g.restore();
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+export function coverTexture(entry, width = 320) {
+  const first = entry.build()[0];
+  const c = document.createElement('canvas');
+  c.width = width;
+  c.height = Math.round((width * first.h) / first.w);
+  const g = c.getContext('2d');
+  g.scale(width / first.w, width / first.w);
+  first.draw(g);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+// The shelf you can borrow from: a bookcase with one level of real books.
+function libraryShelf(item, ctx) {
+  const out = bookshelf({ ...item, reserveLevel: 2 }, ctx);
+  const g = out.object;
+  const library = [];
+  let x = -0.95;
+  for (const id of item.books) {
+    const entry = CATALOG[id];
+    const material = new THREE.MeshStandardMaterial({ color: entry.leather, roughness: 0.55 });
+    const face = new THREE.MeshStandardMaterial({ map: spineTexture(entry.leather, entry.title), roughness: 0.5 });
+    const book = new THREE.Mesh(geo('libbook', () => new THREE.BoxGeometry(0.075, 0.4, 0.3)), [material, material, material, material, face, material]);
+    book.position.set(x + 0.04, 1.16 + 0.02 + 0.2, -0.21 + 0.04 + 0.15);
+    book.castShadow = true;
+    g.add(book);
+    library.push({ id, mesh: book });
+    x += 0.1;
+  }
+  // a few ordinary books after the borrowable ones, and a brass plaque
+  for (let i = 0; i < 9; i++) {
+    const h = 0.28 + ctx.rand() * 0.1;
+    g.add(box(0.05, h, 0.26, mat(['#7b2d26', '#1f3b4d', '#2d6a4f', '#6d597a'][i % 4], { roughness: 0.85 }), x + 0.15 + i * 0.07, 1.18 + h / 2, -0.06));
+  }
+  const plaque = new THREE.Mesh(new THREE.PlaneGeometry(0.36, 0.07), new THREE.MeshStandardMaterial({ map: plaqueTexture('LIBRARY · please borrow'), metalness: 0.6, roughness: 0.35 }));
+  plaque.position.set(-0.65, 1.12, 0.215);
+  g.add(plaque);
+  return { ...out, library };
+}
+
+function plaqueTexture(text) {
+  const c = document.createElement('canvas');
+  c.width = 512;
+  c.height = 100;
+  const g = c.getContext('2d');
+  const grad = g.createLinearGradient(0, 0, 0, 100);
+  grad.addColorStop(0, '#e8c46a');
+  grad.addColorStop(1, '#a8812f');
+  g.fillStyle = grad;
+  g.fillRect(0, 0, 512, 100);
+  g.fillStyle = '#3b2a12';
+  g.font = 'bold 40px Georgia, serif';
+  g.textAlign = 'center';
+  g.textBaseline = 'middle';
+  g.fillText(text, 256, 52);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+function magazineRack(item, ctx) {
+  const g = new THREE.Group();
+  const wood = mat(ctx.theme.wood || '#5a3b28', { roughness: 0.6 });
+  for (const s of [-1, 1]) g.add(rbox(0.04, 1.05, 0.42, wood, s * 0.42, 0.525, 0, 0.01));
+  g.add(rbox(0.88, 0.04, 0.42, wood, 0, 0.06, 0, 0.01));
+  const library = [];
+  item.books.forEach((id, i) => {
+    const y = 0.32 + i * 0.42;
+    const ledge = rbox(0.84, 0.03, 0.08, wood, 0, y - 0.15, 0.12, 0.01);
+    g.add(ledge);
+    const back = box(0.84, 0.32, 0.02, wood, 0, y, -0.06);
+    back.rotation.x = -0.25;
+    g.add(back);
+    const cover = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.36, 0.01), [mat('#f6f0e1'), mat('#f6f0e1'), mat('#f6f0e1'), mat('#f6f0e1'),
+      new THREE.MeshStandardMaterial({ map: coverTexture(CATALOG[id]), roughness: 0.6 }), mat('#f6f0e1')]);
+    cover.position.set(i % 2 ? 0.2 : -0.2, y + 0.02, 0.03);
+    cover.rotation.x = -0.25;
+    cover.castShadow = true;
+    g.add(cover);
+    library.push({ id, mesh: cover });
+  });
+  return { object: g, library };
+}
+
+function door(item, ctx) {
+  const g = new THREE.Group();
+  const wood = mat(ctx.theme.doorWood || '#5a3b28', { roughness: 0.55 });
+  const frame = mat(ctx.theme.trimWood || '#2a1c13', { roughness: 0.6 });
+  g.add(rbox(0.12, 2.3, 0.16, frame, -0.58, 1.15, 0.02), rbox(0.12, 2.3, 0.16, frame, 0.58, 1.15, 0.02), rbox(1.28, 0.14, 0.16, frame, 0, 2.3, 0.02));
+  const pivot = new THREE.Group();
+  pivot.position.set(-0.52, 0, 0.02);
+  const panel = rbox(1.04, 2.2, 0.06, wood, 0.52, 1.1, 0, 0.02);
+  pivot.add(panel);
+  for (const [y, h] of [[1.55, 0.7], [0.6, 0.8]]) pivot.add(rbox(0.8, h, 0.02, mat(shade(ctx.theme.doorWood || '#5a3b28', 0.05), { roughness: 0.5 }), 0.52, y, 0.035, 0.01));
+  pivot.add(sphere(0.04, mat('#c9a66b', { metalness: 0.7, roughness: 0.3 }), 0.92, 1.05, 0.07, 12));
+  g.add(pivot);
+  return { object: g, door: pivot };
+}
+
+// A book or magazine somebody finished with and left lying around.
+export function leftBookMesh(id) {
+  const entry = CATALOG[id];
+  const g = new THREE.Group();
+  if (entry.magazine) {
+    const cover = new THREE.MeshStandardMaterial({ map: coverTexture(entry, 192), roughness: 0.6 });
+    const paper = mat('#f6f0e1');
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.008, 0.26), [paper, paper, cover, paper, paper, paper]);
+    m.position.y = 0.006;
+    g.add(m);
+  } else {
+    const cover = new THREE.MeshStandardMaterial({ map: TX.leatherCover(entry.leather, entry.title, 0.7), roughness: 0.55 });
+    const side = new THREE.MeshStandardMaterial({ map: TX.leatherPlain(entry.leather), roughness: 0.6 });
+    const pages = mat('#efe6d2');
+    const m = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.04, 0.24), [pages, side, cover, side, pages, pages]);
+    m.position.y = 0.022;
+    m.castShadow = true;
+    g.add(m);
+  }
+  g.rotation.y = (TX.hashString(id) % 628) / 100;
+  return g;
+}
+
 export const BUILDERS = {
   sofa: (i, c) => couch(3, i, c),
   loveseat: (i, c) => couch(2, i, c),
@@ -1069,5 +1224,5 @@ export const BUILDERS = {
   beanbag, cushion: cushionSeat, chair, stool, swing: swingChair, lounger, hammock, bench,
   coffeeTable, roundTable, sideTable, rug: rugItem, bookshelf, fireplace, floorLamp, lantern,
   window: windowItem, counter, turntable, painting: paintingItem, neonSign, pergola,
-  stringLights: stringLightsItem, firepit, cat, plant,
+  stringLights: stringLightsItem, firepit, cat, plant, libraryShelf, magazineRack, door,
 };

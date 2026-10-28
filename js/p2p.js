@@ -1,6 +1,7 @@
 import { joinRoom, selfId } from '@trystero-p2p/nostr';
 import {
   ROOM_BY_ID, AVATARS, COLORS, EMOJIS, ITEMS, ITEM_LIFETIME, MAX_PER_ROOM, roomMenu, seatExists,
+  libraryIds, maidPlan, MAID_AFTER, MAID_EVERY,
 } from './shared.js';
 
 // Serverless transport for static hosting (GitHub Pages). Browsers find each
@@ -42,11 +43,19 @@ function sanitize(s) {
     room,
     avatar: AVATAR_SET.has(s.avatar) ? s.avatar : AVATARS[0],
     color: COLOR_SET.has(s.color) ? s.color : COLORS[0],
-    x: 0, z: 0, seat: null, seatAt: 0, drink: null, snack: null, reading: false,
+    x: 0, z: 0, seat: null, seatAt: 0, drink: null, snack: null, reading: false, books: [],
   };
   if (!room) return out;
   out.reading = s.reading === true;
   const def = ROOM_BY_ID[room];
+  const library = libraryIds(def);
+  if (Array.isArray(s.books)) {
+    for (const b of s.books.slice(0, 4)) {
+      if (!b || !library.includes(b.id) || !['reading', 'left'].includes(b.mode) || !Number.isFinite(b.since)) continue;
+      const [x, z] = Number.isFinite(b.x) && Number.isFinite(b.z) ? clamp(def, b.x, b.z) : [0, 0];
+      out.books.push({ id: b.id, mode: b.mode, x, z, since: b.since });
+    }
+  }
   if (Number.isFinite(s.x) && Number.isFinite(s.z)) [out.x, out.z] = clamp(def, s.x, s.z);
   if (seatExists(def, s.seat)) {
     out.seat = s.seat;
@@ -68,6 +77,11 @@ export class P2PNet extends EventTarget {
     this.peers = new Map(); // peerId -> { state, emoji: bucket, order: bucket }
     this.timers = { drink: 0, snack: 0 };
     this.emojiBucket = { tokens: 6, at: Date.now() };
+    this.books = new Map(); // who has which library book, as everyone's states add up
+    this.shelvedAt = new Map(); // book id -> when the maid last put it back (older claims are void)
+    this.collecting = new Set();
+    this.maidRound = Math.floor(Date.now() / MAID_EVERY);
+    setInterval(() => this.maidTick(), 2000);
 
     this.room = joinRoom({ appId: APP_ID, maxReceiveBytes: 4096, relayConfig: { urls: RELAYS } }, 'lounge');
     this.stateAction = this.room.makeAction('state');
@@ -81,7 +95,10 @@ export class P2PNet extends EventTarget {
       console.info('[lounge] peer left', pid);
       const p = this.peers.get(pid);
       this.peers.delete(pid);
-      if (p?.state?.room && p.state.room === this.me?.room) this.emit('left', { id: pid });
+      if (p?.state?.room && p.state.room === this.me?.room) {
+        this.emit('left', { id: pid });
+        this.deriveBooks();
+      }
     };
     this.stateAction.onMessage = (data, { peerId }) => this.onState(peerId, data);
     this.eventAction.onMessage = (data, { peerId }) => this.onEvent(peerId, data);
@@ -103,11 +120,6 @@ export class P2PNet extends EventTarget {
       this.peers.set(pid, p);
     }
     return p;
-  }
-
-  // Everyone shares one clock source: their (NTP-synced) system clock.
-  serverNow(local = performance.timeOrigin + performance.now()) {
-    return local;
   }
 
   async counts() {
@@ -145,21 +157,46 @@ export class P2PNet extends EventTarget {
           room: msg.room,
           avatar: AVATAR_SET.has(msg.avatar) ? msg.avatar : AVATARS[0],
           color: COLOR_SET.has(msg.color) ? msg.color : COLORS[0],
-          x, z, seat: null, seatAt: 0, drink: null, snack: null, reading: false,
+          x, z, seat: null, seatAt: 0, drink: null, snack: null, reading: false, books: [],
         };
         this.broadcast();
+        this.books = new Map();
+        this.deriveBooks(true);
         this.emit('welcome', {
-          id: this.id, room: msg.room, now: Date.now(),
+          id: this.id, room: msg.room,
           peers: [this.publicPeer(this.id, this.me), ...this.roommates().map(([pid, p]) => this.publicPeer(pid, p.state))],
+          books: [...this.books.entries()].map(([id, b]) => ({ id, ...b })),
         });
         break;
       }
       case 'leave':
         if (!this.me) return;
         this.clearItems();
-        this.me = { ...this.me, room: null, seat: null, drink: null, snack: null, reading: false };
+        this.me = { ...this.me, room: null, seat: null, drink: null, snack: null, reading: false, books: [] };
         this.broadcast();
+        this.books = new Map();
         break;
+      case 'book': {
+        if (!room || !libraryIds(room).includes(msg.id)) return;
+        const now = Date.now();
+        const mine = this.me.books;
+        if (msg.mode === 'reading') {
+          const cur = this.books.get(msg.id);
+          if (this.collecting.has(msg.id) || (cur && cur.mode === 'reading' && cur.by !== this.id)) return this.emit('error', { code: 'book-taken' });
+          for (const b of mine) if (b.mode === 'reading') Object.assign(b, { mode: 'left', x: this.me.x, z: this.me.z, since: now });
+          this.me.books = mine.filter((b) => b.id !== msg.id).slice(-3);
+          this.me.books.push({ id: msg.id, mode: 'reading', x: this.me.x, z: this.me.z, since: now });
+        } else if (msg.mode === 'left') {
+          const b = mine.find((x) => x.id === msg.id);
+          if (!b || !Number.isFinite(msg.x) || !Number.isFinite(msg.z)) return;
+          [b.x, b.z] = clamp(room, msg.x, msg.z);
+          b.mode = 'left';
+          b.since = now;
+        } else return;
+        this.broadcast();
+        this.deriveBooks();
+        break;
+      }
       case 'move': {
         if (!room || !Number.isFinite(msg.x) || !Number.isFinite(msg.z)) return;
         [this.me.x, this.me.z] = clamp(room, msg.x, msg.z);
@@ -234,9 +271,14 @@ export class P2PNet extends EventTarget {
     if (!wasIn && isIn) {
       this.emit('joined', { peer: this.publicPeer(pid, next) });
       if (next.seat) this.resolveSeat(pid, next);
+      this.deriveBooks();
       return;
     }
-    if (wasIn && !isIn) return this.emit('left', { id: pid });
+    if (wasIn && !isIn) {
+      this.emit('left', { id: pid });
+      this.deriveBooks();
+      return;
+    }
     if (!isIn) return;
 
     if (next.seat && next.seat !== prev.seat) {
@@ -249,6 +291,7 @@ export class P2PNet extends EventTarget {
       if (prev[kind] && !next[kind]) this.emit('finished', { id: pid, kind });
     }
     if (prev.reading !== next.reading) this.emit('reading', { id: pid, on: next.reading });
+    this.deriveBooks();
   }
 
   // Two people grabbed the same seat at once: the earlier claim keeps it.
@@ -260,6 +303,64 @@ export class P2PNet extends EventTarget {
     this.me.seat = null;
     this.broadcast();
     this.emit('error', { code: 'seat-taken', seat });
+  }
+
+  // ---------------------------------------------------------------- library
+
+  // Who has each library book, from everyone's claims: a reader beats a book
+  // lying around (earliest reader wins a tie); otherwise the latest put-down.
+  deriveBooks(quiet = false) {
+    const next = new Map();
+    if (this.me?.room) {
+      const claims = [[this.id, this.me], ...this.roommates().map(([pid, p]) => [pid, p.state])];
+      for (const [by, st] of claims) {
+        for (const b of st.books || []) {
+          if (b.since <= (this.shelvedAt.get(b.id) || 0)) continue;
+          const cur = next.get(b.id);
+          const better = !cur
+            || (b.mode === 'reading' && (cur.mode !== 'reading' || b.since < cur.since))
+            || (b.mode === 'left' && cur.mode === 'left' && b.since > cur.since);
+          if (better) next.set(b.id, { by, mode: b.mode, x: b.x, z: b.z, since: b.since });
+        }
+      }
+    }
+    if (!quiet) {
+      for (const [id, b] of next) {
+        const old = this.books.get(id);
+        if (!old || old.by !== b.by || old.mode !== b.mode || old.x !== b.x || old.z !== b.z) this.emit('book', { id, ...b });
+      }
+      for (const id of this.books.keys()) if (!next.has(id)) this.emit('book', { id, by: null, mode: null });
+    }
+    this.books = next;
+  }
+
+  // Every MAID_EVERY ms (same wall-clock rounds in every browser) the maid
+  // collects books that have been lying around for a while.
+  maidTick() {
+    const round = Math.floor(Date.now() / MAID_EVERY);
+    if (round === this.maidRound || !this.me?.room) return;
+    this.maidRound = round;
+    const now = Date.now();
+    const left = [...this.books.entries()]
+      .filter(([id, b]) => b.mode === 'left' && !this.collecting.has(id) && now - b.since > MAID_AFTER)
+      .map(([id, b]) => ({ id, x: b.x, z: b.z }))
+      .sort((a, b) => (a.id < b.id ? -1 : 1));
+    const plan = maidPlan(ROOM_BY_ID[this.me.room], left);
+    if (!plan) return;
+    for (const b of left) this.collecting.add(b.id);
+    this.emit('maid', { books: left });
+    setTimeout(() => {
+      const done = Date.now();
+      for (const b of left) {
+        this.collecting.delete(b.id);
+        this.shelvedAt.set(b.id, done);
+      }
+      if (this.me?.books) {
+        this.me.books = this.me.books.filter((b) => !(b.mode === 'left' && left.some((l) => l.id === b.id)));
+        this.broadcast();
+      }
+      this.deriveBooks();
+    }, plan.duration * 1000);
   }
 
   onEvent(pid, data) {
