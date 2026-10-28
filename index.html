@@ -7,18 +7,7 @@
   <meta name="description" content="Cozy 3D lounges: sit, sip, listen together — and talk only in emojis.">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☕</text></svg>">
   <link rel="stylesheet" href="style.css">
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "./vendor/three/build/three.module.js",
-        "three/addons/": "./vendor/three/examples/jsm/",
-        "@trystero-p2p/nostr": "./vendor/trystero-nostr/index.mjs",
-        "@trystero-p2p/core": "./vendor/trystero-core/index.mjs",
-        "@noble/secp256k1": "./vendor/noble-secp256k1/index.js",
-        "pdfjs-dist": "./vendor/pdfjs/build/pdf.min.mjs"
-      }
-    }
-  </script>
+  <link rel="modulepreload" href="app/main-5KF23B2C.js">
 </head>
 <body>
   <canvas id="scene"></canvas>
@@ -106,6 +95,6 @@
 
   <div id="toast" class="toast"></div>
 
-  <script type="module" src="js/main.js"></script>
+  <script type="module" src="app/main-5KF23B2C.js"></script>
 </body>
 </html>
